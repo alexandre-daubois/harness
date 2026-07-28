@@ -63,6 +63,54 @@ func TestParsePlainMarkdown(t *testing.T) {
 	}
 }
 
+func TestParseSourceHashIncludesSchema(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, skillFilename)
+	writeFile(t, path, "---\nname: audit\ndescription: Audit\n---\nCheck it.\n")
+
+	withoutSchema, err := Parse(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, schemaFilename), `{"type":"object"}`)
+	withSchema, err := Parse(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withSchema.SourceHash == withoutSchema.SourceHash {
+		t.Fatal("SourceHash did not change when schema.json was added")
+	}
+	if withSchema.SchemaJSON != `{"type":"object"}` {
+		t.Errorf("SchemaJSON = %q", withSchema.SchemaJSON)
+	}
+
+	writeFile(t, filepath.Join(dir, schemaFilename), `{"type":"array"}`)
+	changedSchema, err := Parse(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedSchema.SourceHash == withSchema.SourceHash {
+		t.Fatal("SourceHash did not change after a schema-only edit")
+	}
+}
+
+func TestRender(t *testing.T) {
+	t.Parallel()
+
+	rendered, err := Render(&Skill{
+		Name:        "audit",
+		Description: "Check a repository",
+		Body:        "Read the code.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "---\nname: audit\ndescription: Check a repository\n---\n\nRead the code.\n"
+	if string(rendered) != want {
+		t.Errorf("Render() = %q, want %q", rendered, want)
+	}
+}
+
 func TestParseWarnsOnSpecFields(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, skillFilename)

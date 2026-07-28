@@ -10,12 +10,14 @@ import (
 )
 
 // CopilotHarness drives GitHub Copilot CLI in non-interactive prompt mode.
-//
-// Its JSONL mapping is based on Copilot CLI 1.0.75.
+// Its arguments and JSONL mapping are based on Copilot CLI 1.0.75.
 type CopilotHarness struct{}
 
 func (CopilotHarness) Binary() string { return "copilot" }
 
+// Args enables autopilot and tool use without interactive confirmation. The
+// caller must isolate the process and workspace because --allow-all grants the
+// CLI every tool it exposes.
 func (CopilotHarness) Args(j Job) []string {
 	maxTurns := j.MaxTurns
 	if maxTurns <= 0 {
@@ -44,10 +46,36 @@ func (CopilotHarness) Prompt(j Job) string {
 	return explicitSkillPrompt(j, "./.github/skills/"+j.SkillName)
 }
 
+// ParseStream combines per-call assistant.usage and per-turn
+// assistant.turn_end records into one result emitted after the stream ends.
+// This gives callers the same single-run totals exposed by the other backends
+// and prevents consumers that retain only the last result from losing usage.
 func (CopilotHarness) ParseStream(r io.Reader, emit func(Event)) {
-	scanJSONL(r, emit, parseCopilotLine)
+	total := Event{Kind: KindResult}
+	sawResult := false
+	scanJSONL(r, func(event Event) {
+		if event.Kind != KindResult {
+			emit(event)
+			return
+		}
+		sawResult = true
+		total.CostUSD += event.CostUSD
+		total.Turns += event.Turns
+		total.Usage.InputTokens += event.Usage.InputTokens
+		total.Usage.OutputTokens += event.Usage.OutputTokens
+		total.Usage.CacheReadTokens += event.Usage.CacheReadTokens
+		total.Usage.CacheWriteTokens += event.Usage.CacheWriteTokens
+		if event.Text != "" {
+			total.Text = event.Text
+		}
+	}, parseCopilotLine)
+	if sawResult {
+		emit(total)
+	}
 }
 
+// copilotLine contains the shared envelope fields used by prompt-mode JSONL.
+// Unknown event types pass through as text so a CLI update remains visible.
 type copilotLine struct {
 	Type      string          `json:"type"`
 	Data      json.RawMessage `json:"data"`
@@ -70,10 +98,11 @@ type copilotToolData struct {
 }
 
 type copilotUsageData struct {
-	InputTokens      int `json:"inputTokens"`
-	OutputTokens     int `json:"outputTokens"`
-	CacheReadTokens  int `json:"cacheReadTokens"`
-	CacheWriteTokens int `json:"cacheWriteTokens"`
+	Model            string `json:"model"`
+	InputTokens      int    `json:"inputTokens"`
+	OutputTokens     int    `json:"outputTokens"`
+	CacheReadTokens  int    `json:"cacheReadTokens"`
+	CacheWriteTokens int    `json:"cacheWriteTokens"`
 }
 
 type copilotErrorData struct {
@@ -111,12 +140,21 @@ func parseCopilotLine(raw []byte, emit func(Event)) {
 	case "assistant.usage":
 		var data copilotUsageData
 		if json.Unmarshal(event.Data, &data) == nil {
+			usage := Usage{
+				InputTokens:      data.InputTokens,
+				OutputTokens:     data.OutputTokens,
+				CacheReadTokens:  data.CacheReadTokens,
+				CacheWriteTokens: data.CacheWriteTokens,
+			}
 			emit(Event{
-				Kind:  KindResult,
-				Usage: Usage(data),
+				Kind:    KindResult,
+				CostUSD: CostFromUsage(data.Model, usage),
+				Usage:   usage,
 			})
 		}
 	case "assistant.turn_end":
+		// Copilot reports turns separately from token usage. ParseStream merges
+		// both records into one result after all turns finish.
 		emit(Event{Kind: KindResult, Turns: 1})
 	case "result":
 		if event.SessionID != "" {
@@ -125,6 +163,9 @@ func parseCopilotLine(raw []byte, emit func(Event)) {
 		if event.ExitCode != nil && *event.ExitCode != 0 {
 			emit(Event{Kind: KindError, Text: fmt.Sprintf("copilot exited with code %d", *event.ExitCode)})
 		}
+		// The final envelope guarantees a terminal result even if a failed or
+		// empty run produced no usage and no completed turn.
+		emit(Event{Kind: KindResult})
 	case "abort", "session.error", "error":
 		emitCopilotError(event.Data, line, emit)
 	case "assistant.message_delta",
@@ -183,7 +224,11 @@ func (CopilotHarness) GuideFilename() string {
 	return filepath.Join(".github", "copilot-instructions.md")
 }
 
+func (CopilotHarness) SystemPromptViaArgs() bool { return false }
+
 func (CopilotHarness) EgressHosts() []string {
+	// GitHub hosts authentication and MCP traffic; githubcopilot.com serves
+	// Copilot's model and session APIs.
 	return []string{
 		"github.com",
 		"api.github.com",
@@ -210,6 +255,8 @@ func (CopilotHarness) StateEnv(dir string) []string {
 }
 
 func (CopilotHarness) DefaultModels() []ModelDefault {
+	// These IDs are accepted by Copilot CLI 1.0.75. Dotted Anthropic IDs are
+	// distinct from Claude Code's hyphenated provider IDs.
 	return []ModelDefault{
 		{Name: "Claude Sonnet 4.6", ID: "claude-sonnet-4.6", Tier: "high"},
 		{Name: "Claude Haiku 4.5", ID: "claude-haiku-4.5", Tier: "mid"},
@@ -219,6 +266,8 @@ func (CopilotHarness) DefaultModels() []ModelDefault {
 	}
 }
 
+// copilotAccountPhrases cover authentication, entitlement, and request-limit
+// failures where an immediate retry is unlikely to help.
 var copilotAccountPhrases = []string{
 	"rate limit",
 	"too many requests",

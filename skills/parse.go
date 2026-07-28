@@ -1,4 +1,7 @@
-// Package skills parses, filters, and stages agent skill directories.
+// Package skills parses, filters, and stages agent skill directories. The core
+// SKILL.md format is described at [SpecURL]. [Skill.SchemaJSON] exposes a
+// conventional sibling file permitted by the specification's open directory
+// layout.
 package skills
 
 import (
@@ -13,11 +16,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// SpecURL is the Agent Skills format specification.
+const SpecURL = "https://agentskills.io/specification"
+
 const (
-	skillFilename = "SKILL.md"
-	maxNameLen    = 64
-	maxDescLen    = 1024
-	maxCompatLen  = 500
+	skillFilename  = "SKILL.md"
+	schemaFilename = "schema.json"
+	maxNameLen     = 64
+	maxDescLen     = 1024
+	maxCompatLen   = 500
 )
 
 var (
@@ -35,8 +42,16 @@ type Skill struct {
 	Metadata      map[string]any
 	Body          string
 	SourcePath    string
-	SourceHash    string
-	Warnings      []string
+	// SchemaJSON is the unmodified content of a sibling schema.json. The file
+	// is a common extension rather than a named field in the Agent Skills
+	// specification.
+	SchemaJSON string
+	// SourceHash is the SHA-256 of the instruction file followed by its
+	// sibling schema.json, when present. Including the schema makes a
+	// schema-only edit visible to callers that use this value for change
+	// detection.
+	SourceHash string
+	Warnings   []string
 }
 
 type frontmatter struct {
@@ -58,6 +73,10 @@ func Parse(path string) (*Skill, error) {
 	if err != nil {
 		return nil, fmt.Errorf("skills: resolve %s: %w", path, err)
 	}
+	schema, err := os.ReadFile(filepath.Join(abs, schemaFilename))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("skills: read %s: %w", schemaFilename, err)
+	}
 	fm, body, hasFrontmatter := splitFrontmatter(raw)
 	parsed := frontmatter{Metadata: make(map[string]any)}
 	if hasFrontmatter {
@@ -77,7 +96,8 @@ func Parse(path string) (*Skill, error) {
 		Metadata:      parsed.Metadata,
 		Body:          strings.TrimSpace(body),
 		SourcePath:    abs,
-		SourceHash:    hash(raw),
+		SchemaJSON:    string(schema),
+		SourceHash:    hash(raw, schema),
 	}
 	if !hasFrontmatter {
 		skill.Body = strings.TrimSpace(string(raw))
@@ -94,9 +114,12 @@ func splitFrontmatter(raw []byte) ([]byte, string, bool) {
 	return match[1], string(match[2]), true
 }
 
-func hash(raw []byte) string {
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
+func hash(parts ...[]byte) string {
+	hasher := sha256.New()
+	for _, part := range parts {
+		_, _ = hasher.Write(part)
+	}
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 func (s *Skill) validate(path string, hadFrontmatter bool) {
@@ -143,7 +166,8 @@ func ValidateNamespace(meta map[string]any, prefix string, allowed map[string]bo
 	return nil
 }
 
-func render(skill *Skill) ([]byte, error) {
+// Render returns the SKILL.md bytes for skill with one trailing newline.
+func Render(skill *Skill) ([]byte, error) {
 	if skill == nil {
 		return nil, fmt.Errorf("skills: skill is required")
 	}

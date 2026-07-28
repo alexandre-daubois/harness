@@ -53,12 +53,21 @@ func Stage(h harness.Harness, job harness.Job, skill *Skill) error {
 			return fmt.Errorf("skills: copy siblings: %w", err)
 		}
 	}
-	content, err := render(skill)
+	content, err := Render(skill)
 	if err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(destination, skillFilename), content, filePerm); err != nil {
 		return fmt.Errorf("skills: write SKILL.md: %w", err)
+	}
+	if skill.SchemaJSON != "" {
+		if err := os.WriteFile(
+			filepath.Join(destination, schemaFilename),
+			[]byte(skill.SchemaJSON),
+			filePerm,
+		); err != nil {
+			return fmt.Errorf("skills: write schema.json: %w", err)
+		}
 	}
 	return nil
 }

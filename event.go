@@ -19,7 +19,9 @@ const (
 	lineLimit = 300
 )
 
-// Event is one backend-neutral item from an agent's output stream.
+// Event is one backend-neutral item from an agent's output stream. Tool,
+// CostUSD, Turns, Usage, SessionID, and RateLimit are populated only for their
+// corresponding Kind.
 type Event struct {
 	Kind      string
 	Tool      string
@@ -66,9 +68,13 @@ func (r *RateLimitInfo) Rejected() bool {
 	if strings.EqualFold(r.Status, "rejected") {
 		return true
 	}
+	// Accounts without paid overage commonly report overageStatus:"rejected".
+	// It blocks a request only when the account is currently using overage.
 	return r.IsUsingOverage && strings.EqualFold(r.OverageStatus, "rejected")
 }
 
+// summariseInput extracts the useful part of common tool payloads. Tool-name
+// casing differs between backends, so matching is case-insensitive.
 func summariseInput(tool string, raw json.RawMessage) string {
 	var input map[string]any
 	_ = json.Unmarshal(raw, &input)

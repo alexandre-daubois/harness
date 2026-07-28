@@ -33,10 +33,13 @@ func (runTestHarness) SkillDir(workspace, name string) string {
 	return filepath.Join(workspace, "skills", name)
 }
 
-func (runTestHarness) GuideFilename() string         { return "AGENTS.md" }
-func (runTestHarness) EgressHosts() []string         { return nil }
-func (runTestHarness) StateEnv(string) []string      { return nil }
-func (runTestHarness) DefaultModels() []ModelDefault { return nil }
+func (runTestHarness) GuideFilename() string     { return "AGENTS.md" }
+func (runTestHarness) SystemPromptViaArgs() bool { return false }
+func (runTestHarness) EgressHosts() []string     { return nil }
+func (runTestHarness) StateEnv(string) []string  { return nil }
+func (runTestHarness) DefaultModels() []ModelDefault {
+	return nil
+}
 
 func (runTestHarness) Env(string) []string {
 	return []string{"HARNESS_RUN_HELPER=1", "HARNESS_RUN_VALUE=override"}

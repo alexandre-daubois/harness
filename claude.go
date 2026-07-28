@@ -8,11 +8,15 @@ import (
 	"strings"
 )
 
-// ClaudeHarness drives Claude Code in print mode.
+// ClaudeHarness drives Claude Code in print mode. It is the default backend
+// because the original caller used Claude before the shared interface existed.
 type ClaudeHarness struct{}
 
 func (ClaudeHarness) Binary() string { return "claude" }
 
+// Args builds the claude -p invocation. An allowed-tools list uses
+// acceptEdits only when the job has a legitimate output file; otherwise the
+// default permission mode keeps the requested read-only boundary intact.
 func (ClaudeHarness) Args(j Job) []string {
 	args := []string{
 		"-p",
@@ -47,6 +51,10 @@ func (ClaudeHarness) Args(j Job) []string {
 	return append(args, ClaudeHarness{}.Prompt(j))
 }
 
+// claudePermissionMode selects the mode for a job with an allowed-tools list.
+// acceptEdits lets a skill write its report without prompting, but it also
+// approves edits omitted from the allowlist. A job with no output file has
+// nothing legitimate to write, so it stays in the default mode.
 func claudePermissionMode(j Job) string {
 	if j.OutputFile == "" {
 		return "default"
@@ -59,16 +67,19 @@ func (ClaudeHarness) Prompt(j Job) string {
 	case j.ResumeSessionID != "" && j.ResumePrompt != "":
 		return j.ResumePrompt
 	case j.ResumeSessionID != "":
-		return buildResumePrompt(j.SkillName, j.OutputFile)
+		return buildResumePrompt(j)
 	case j.Prompt != "":
 		return j.Prompt
 	case j.SkillName != "":
-		return buildSkillPrompt(j.SkillName, j.OutputFile)
+		return buildSkillPrompt(j)
 	default:
 		return ""
 	}
 }
 
+// ParseStream reads Claude's stream-json output. scanJSONL uses a buffered
+// reader rather than Scanner so an oversized thinking or tool-result line
+// cannot discard the later result event that carries usage and turn counts.
 func (ClaudeHarness) ParseStream(r io.Reader, emit func(Event)) {
 	scanJSONL(r, emit, parseClaudeLine)
 }
@@ -79,10 +90,15 @@ func (ClaudeHarness) SkillDir(workspace, name string) string {
 
 func (ClaudeHarness) GuideFilename() string { return "CLAUDE.md" }
 
+func (ClaudeHarness) SystemPromptViaArgs() bool { return true }
+
 func (ClaudeHarness) EgressHosts() []string { return []string{"*.anthropic.com"} }
 
 func (ClaudeHarness) Env(baseURL string) []string {
 	env := []string{
+		// Suppress telemetry, updates, bug reporting, and non-essential model
+		// calls that a headless run does not need. An egress proxy may deny
+		// them too, but disabling them at source keeps the stream quiet.
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 		"OTEL_SDK_DISABLED=true",
 		"DISABLE_TELEMETRY=1",
@@ -91,6 +107,8 @@ func (ClaudeHarness) Env(baseURL string) []string {
 		"DISABLE_AUTOUPDATER=1",
 		"DISABLE_NON_ESSENTIAL_MODEL_CALLS=1",
 	}
+	// Credentials stay as bare passthrough keys so process runners can inject
+	// them without putting secret values in argv.
 	env = append(env, passthroughEnv("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")...)
 	if baseURL != "" {
 		env = append(env, "ANTHROPIC_BASE_URL="+baseURL)
@@ -107,6 +125,8 @@ func (ClaudeHarness) AccountErrorText(s string) string {
 }
 
 func (ClaudeHarness) DefaultModels() []ModelDefault {
+	// Explicit tier tags avoid forcing callers to infer defaults from display
+	// names. The first model remains the backend default.
 	return []ModelDefault{
 		{Name: "Opus 4.6", ID: "claude-opus-4-6", Tier: "high"},
 		{Name: "Opus 4.7", ID: "claude-opus-4-7"},
@@ -155,6 +175,11 @@ func parseClaudeLine(raw []byte, emit func(Event)) {
 	}
 	switch message.Type {
 	case "system":
+		// The init event is the only reliable session identifier. It arrives
+		// early enough to persist before a crash and proves that --resume
+		// loaded the saved conversation. A failed resume emits no init, then
+		// reports a new throwaway session id in its result, which must not be
+		// treated as a successful resume.
 		if message.Subtype == "init" && message.SessionID != "" {
 			emit(Event{Kind: KindSession, SessionID: message.SessionID})
 		}

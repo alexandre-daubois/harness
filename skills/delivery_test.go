@@ -19,6 +19,7 @@ func TestStage(t *testing.T) {
 		Description: "Audit",
 		Body:        "New body",
 		SourcePath:  source,
+		SchemaJSON:  `{"type":"object"}`,
 		Metadata:    map[string]any{},
 	}
 	job := harness.Job{Workspace: workspace, SkillName: "audit"}
@@ -36,6 +37,13 @@ func TestStage(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(destination, "scripts", "check.sh")); err != nil {
 		t.Fatal(err)
+	}
+	schema, err := os.ReadFile(filepath.Join(destination, schemaFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(schema) != skill.SchemaJSON {
+		t.Errorf("schema.json = %q", schema)
 	}
 
 	writeFile(t, filepath.Join(destination, "stale.txt"), "stale")

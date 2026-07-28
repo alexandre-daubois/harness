@@ -3,6 +3,7 @@ package skills
 import (
 	"errors"
 	"path"
+	"slices"
 	"testing"
 )
 
@@ -56,5 +57,21 @@ func TestPathFilters(t *testing.T) {
 	}
 	if !DirAllExcluded("src/generated", paths, ignore) {
 		t.Fatal("generated directory was not blanketed")
+	}
+}
+
+func TestPatternStorageRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	patterns := SplitPatterns(" src/** \n\nvendor/**\n*.go ")
+	want := []string{"src/**", "vendor/**", "*.go"}
+	if !slices.Equal(patterns, want) {
+		t.Errorf("SplitPatterns() = %v, want %v", patterns, want)
+	}
+	if got := JoinPatterns(patterns); got != "src/**\nvendor/**\n*.go" {
+		t.Errorf("JoinPatterns() = %q", got)
+	}
+	if SplitPatterns("") != nil {
+		t.Fatal("SplitPatterns(\"\") did not return nil")
 	}
 }

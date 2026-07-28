@@ -157,6 +157,7 @@ func (unregisteredHarness) Prompt(Job) string                  { return "" }
 func (unregisteredHarness) ParseStream(io.Reader, func(Event)) {}
 func (unregisteredHarness) SkillDir(string, string) string     { return "" }
 func (unregisteredHarness) GuideFilename() string              { return "" }
+func (unregisteredHarness) SystemPromptViaArgs() bool          { return false }
 func (unregisteredHarness) EgressHosts() []string              { return nil }
 func (unregisteredHarness) Env(string) []string                { return nil }
 func (unregisteredHarness) StateEnv(string) []string           { return nil }

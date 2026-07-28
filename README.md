@@ -39,6 +39,7 @@ configuration defaults before constructing it.
 ```go
 type Job struct {
     Workspace string
+    SrcDir    string
     SkillName string
 
     Prompt       string
@@ -57,10 +58,12 @@ type Job struct {
 }
 ```
 
-`Workspace` is the command's working directory. `SkillName` selects a staged
-`SKILL.md`; when `Prompt` is empty, the backend builds a short activation
-prompt. `SystemPrompt` uses `--system-prompt` with Claude and the backend's
-project instruction file for the other CLIs.
+`Workspace` is the command's working directory. `SrcDir` is the repository
+directory relative to it and defaults to `src`; set it to `.` when `Workspace`
+is already the repository root. `SkillName` selects a staged `SKILL.md`; when
+`Prompt` is empty, the backend builds a short activation prompt. `SystemPrompt`
+uses `--system-prompt` with Claude and the backend's project instruction file
+for the other CLIs.
 
 `MaxTurns` uses the backend default when set to zero. `Effort` and
 `AllowedTools` currently apply only to Claude. `ResumeSessionID` and
@@ -77,6 +80,7 @@ type Harness interface {
     ParseStream(io.Reader, func(Event))
     SkillDir(workspace, name string) string
     GuideFilename() string
+    SystemPromptViaArgs() bool
     EgressHosts() []string
     Env(baseURL string) []string
     StateEnv(dir string) []string
@@ -147,6 +151,7 @@ func main() {
 
     job := harness.Job{
         Workspace:    workspace,
+        SrcDir:       ".",
         Prompt:       "Review this project for security defects.",
         SystemPrompt: skills.Concat(instructions),
         Model:        "claude-sonnet-4-6",
@@ -181,6 +186,7 @@ if err != nil {
 }
 job := harness.Job{
     Workspace:  "/work",
+    SrcDir:     ".",
     SkillName:  "security-review",
     Model:      "gpt-5.3-codex",
     OutputFile: "report.json",
@@ -203,8 +209,9 @@ h.ParseStream(stdout, func(event harness.Event) {
 })
 ```
 
-`WriteSystemPrompt` is needed only when `SystemPrompt` is non-empty. Claude
-receives that value in its arguments, so the helper does not write `CLAUDE.md`.
+`WriteSystemPrompt` is needed only when `SystemPrompt` is non-empty. Backends
+whose `SystemPromptViaArgs` method returns true receive that value in their
+arguments, so the helper does not write a guide file.
 
 ## Process isolation
 
@@ -225,7 +232,9 @@ the allowlist.
 
 `skills` parses `SKILL.md` and plain markdown instructions, walks skill
 directories, validates metadata namespaces and glob patterns, stages a skill
-for any backend, and joins instruction bodies for a system prompt.
+for any backend, and joins instruction bodies for a system prompt. `Render`
+returns `SKILL.md` bytes for in-memory skills. A parsed skill retains a sibling
+`schema.json` in `SchemaJSON` and includes it in `SourceHash`.
 
 `egress` contains the authenticated allowlist proxy and
 `WriteSandboxSettings`, which writes Claude's `.claude/settings.json` domain

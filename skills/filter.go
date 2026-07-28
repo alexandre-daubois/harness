@@ -88,3 +88,23 @@ func matchSegments(pattern, name []string) bool {
 	}
 	return len(name) == 0
 }
+
+// SplitPatterns parses the newline-separated storage form into a clean slice,
+// trimming whitespace and dropping empty lines.
+func SplitPatterns(value string) []string {
+	if value == "" {
+		return nil
+	}
+	var patterns []string
+	for line := range strings.SplitSeq(value, "\n") {
+		if pattern := strings.TrimSpace(line); pattern != "" {
+			patterns = append(patterns, pattern)
+		}
+	}
+	return patterns
+}
+
+// JoinPatterns serialises patterns into the newline-separated storage form.
+func JoinPatterns(patterns []string) string {
+	return strings.Join(patterns, "\n")
+}

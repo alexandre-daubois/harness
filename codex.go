@@ -8,11 +8,17 @@ import (
 	"strings"
 )
 
-// CodexHarness drives Codex in headless exec mode.
+// CodexHarness drives Codex in headless exec mode. Codex discovers skills in
+// ./skills, reads AGENTS.md as project guidance, and stores resumable threads
+// under CODEX_HOME.
 type CodexHarness struct{}
 
 func (CodexHarness) Binary() string { return "codex" }
 
+// Args builds codex exec argv. Headless Codex has no slash-style skill
+// invocation, so Prompt names the staged SKILL.md. Resume inserts the thread
+// id after "exec resume". Codex has no per-turn cap, so Job.MaxTurns is
+// intentionally ignored.
 func (CodexHarness) Args(j Job) []string {
 	var args []string
 	if j.BaseURL != "" {
@@ -21,6 +27,10 @@ func (CodexHarness) Args(j Job) []string {
 	args = append(args,
 		"exec",
 		"--json",
+		// Codex's Linux sandbox uses bubblewrap, which does not work in
+		// restricted container runners without unprivileged user namespaces.
+		// danger-full-access avoids that nested layer. The caller must provide
+		// the filesystem, process, and network isolation described in README.
 		"--sandbox", "danger-full-access",
 		"--skip-git-repo-check",
 	)
@@ -37,10 +47,17 @@ func (CodexHarness) Prompt(j Job) string {
 	return explicitSkillPrompt(j, "./skills/"+j.SkillName)
 }
 
+// ParseStream maps codex exec --json output onto backend-neutral events.
+// Session announcements enable resume, item completions carry text and tools,
+// and unknown or non-JSON lines pass through as text. Codex has no max-turns
+// event because its exec command has no turn cap.
 func (CodexHarness) ParseStream(r io.Reader, emit func(Event)) {
 	scanJSONL(r, emit, parseCodexLine)
 }
 
+// codexLine contains the fields used from codex exec --json. These shapes were
+// verified against Codex 0.142.5. Unknown event types remain visible as text
+// instead of being silently dropped.
 type codexLine struct {
 	Type      string          `json:"type"`
 	SessionID string          `json:"session_id"`
@@ -65,6 +82,7 @@ type codexItem struct {
 	Input   json.RawMessage `json:"input"`
 }
 
+// codexUsage is the turn.completed token breakdown.
 type codexUsage struct {
 	InputTokens       int `json:"input_tokens"`
 	CachedInputTokens int `json:"cached_input_tokens"`
@@ -78,6 +96,9 @@ func parseCodexLine(raw []byte, emit func(Event)) {
 	}
 	var event codexLine
 	if err := json.Unmarshal(raw, &event); err != nil {
+		// Codex writes this line to stderr on every headless run even when
+		// stdin is closed. Combined-output runners would otherwise show it in
+		// every log.
 		if strings.HasPrefix(line, "Reading additional input from stdin") {
 			return
 		}
@@ -92,6 +113,7 @@ func parseCodexLine(raw []byte, emit func(Event)) {
 		}
 		emit(Event{Kind: KindSession, SessionID: id})
 	case event.Type == "turn.started":
+		// This marker has no payload; completed items carry the content.
 	case event.Type == "turn.completed":
 		var usage Usage
 		if event.Usage != nil {
@@ -101,8 +123,13 @@ func parseCodexLine(raw []byte, emit func(Event)) {
 				CacheReadTokens: event.Usage.CachedInputTokens,
 			}
 		}
+		// Codex emits one turn.completed event for the prompt sent by this
+		// invocation. It supplies tokens but no price, so callers can use
+		// CostFromUsage when they need a list-price estimate.
 		emit(Event{Kind: KindResult, Usage: usage, Turns: 1})
 	case event.Type == "item.started":
+		// item.completed repeats the identifying fields and adds the result.
+		// Emitting both would display each command twice.
 	case event.Item != nil && event.Item.Type == "error":
 		emit(Event{Kind: KindError, Text: event.Item.Message})
 	case event.Item != nil && event.Item.Text != "":
@@ -165,12 +192,18 @@ func (CodexHarness) SkillDir(workspace, name string) string {
 
 func (CodexHarness) GuideFilename() string { return "AGENTS.md" }
 
+func (CodexHarness) SystemPromptViaArgs() bool { return false }
+
 func (CodexHarness) EgressHosts() []string {
+	// api.openai.com serves model requests. auth0.openai.com and chatgpt.com
+	// support the ChatGPT login flow used without an API key.
 	return []string{"api.openai.com", "auth0.openai.com", "chatgpt.com"}
 }
 
 func (CodexHarness) Env(_ string) []string {
 	env := []string{
+		// Disable Codex's telemetry exporters at source so an egress proxy does
+		// not have to reject and log the same requests for every run.
 		"RUST_LOG=error,opentelemetry_sdk=off,opentelemetry_otlp=off",
 		"OMO_CODEX_SEND_ANONYMOUS_TELEMETRY=0",
 		"OMO_CODEX_DISABLE_POSTHOG=1",
@@ -183,6 +216,8 @@ func (CodexHarness) StateEnv(dir string) []string {
 }
 
 func (CodexHarness) DefaultModels() []ModelDefault {
+	// IDs mirror Codex's built-in model catalog. The Codex-tuned model comes
+	// first because that is the CLI's default when --model is absent.
 	return []ModelDefault{
 		{Name: "GPT-5.3 Codex", ID: "gpt-5.3-codex", Tier: "high"},
 		{Name: "GPT-5.4 mini", ID: "gpt-5.4-mini", Tier: "mid"},
@@ -192,6 +227,8 @@ func (CodexHarness) DefaultModels() []ModelDefault {
 	}
 }
 
+// codexAccountPhrases are provider account failures that an immediate retry
+// cannot fix.
 var codexAccountPhrases = []string{
 	"rate_limit",
 	"rate limit",

@@ -5,6 +5,10 @@ import (
 	"io"
 )
 
+// scanJSONL reads complete logical lines without bufio.Scanner's token limit.
+// Agent output can contain very large thinking blocks or tool results; losing
+// the remainder would also lose terminal usage, session, and error events.
+// Non-EOF read failures become one error event.
 func scanJSONL(r io.Reader, emit func(Event), parse func([]byte, func(Event))) {
 	br := bufio.NewReader(r)
 	for {

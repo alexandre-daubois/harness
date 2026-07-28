@@ -10,8 +10,12 @@ import (
 const (
 	guideDirMode  = 0o755
 	guideFileMode = 0o644
+	defaultSrcDir = "src"
 )
 
+// explicitSkillPrompt is the activation prompt for backends that discover a
+// SKILL.md but do not have a native skill invocation. An explicit resume
+// prompt is returned unchanged so callers can send a targeted repair nudge.
 func explicitSkillPrompt(j Job, skillPath string) string {
 	resume := j.ResumeSessionID != ""
 	if resume && j.ResumePrompt != "" {
@@ -30,7 +34,7 @@ func explicitSkillPrompt(j Job, skillPath string) string {
 	if resume {
 		verb = "Continue following"
 	}
-	prompt := verb + " the instructions in " + skillPath + "/SKILL.md against the repository at ./src."
+	prompt := verb + " the instructions in " + skillPath + "/SKILL.md against the repository cloned at " + sourcePromptPath(j) + "."
 	if j.OutputFile != "" {
 		prompt += " Write your structured output to ./" + j.OutputFile + " as the skill specifies."
 		prompt += schemaValidationHint(j.OutputFile)
@@ -38,39 +42,73 @@ func explicitSkillPrompt(j Job, skillPath string) string {
 	return prompt
 }
 
-func buildSkillPrompt(name, outputFile string) string {
-	prompt := fmt.Sprintf("Use the %q skill on the repository at ./src.", name)
-	if outputFile != "" {
-		prompt += fmt.Sprintf(" Write your structured output to ./%s as the skill specifies.", outputFile)
-		prompt += schemaValidationHint(outputFile)
+// buildSkillPrompt is Claude's activation prompt. SKILL.md holds the actual
+// instructions, so the prompt only selects it and locates the repository.
+func buildSkillPrompt(j Job) string {
+	prompt := fmt.Sprintf("Use the %q skill on the repository cloned at %s.", j.SkillName, sourcePromptPath(j))
+	if j.OutputFile != "" {
+		prompt += fmt.Sprintf(" Write your structured output to ./%s as the skill specifies.", j.OutputFile)
+		prompt += schemaValidationHint(j.OutputFile)
 	}
 	return prompt
 }
 
-func buildResumePrompt(name, outputFile string) string {
-	if name == "" {
+// buildResumePrompt tells a resumed agent to continue and restates the output
+// file, which is easy to lose among the earlier conversation turns.
+func buildResumePrompt(j Job) string {
+	if j.SkillName == "" {
 		return "Continue from where you left off."
 	}
-	prompt := fmt.Sprintf("Continue the %q skill on the repository at ./src from where you left off.", name)
-	if outputFile != "" {
-		prompt += fmt.Sprintf(" Write your structured output to ./%s as the skill specifies.", outputFile)
-		prompt += schemaValidationHint(outputFile)
+	prompt := fmt.Sprintf(
+		"Continue the %q skill on the repository at %s from where you left off.",
+		j.SkillName,
+		sourcePromptPath(j),
+	)
+	if j.OutputFile != "" {
+		prompt += fmt.Sprintf(" Write your structured output to ./%s as the skill specifies.", j.OutputFile)
+		prompt += schemaValidationHint(j.OutputFile)
 	}
 	return prompt
 }
 
-func schemaValidationHint(outputFile string) string {
-	if !strings.HasSuffix(strings.ToLower(outputFile), ".json") {
-		return ""
+// sourcePromptPath keeps the historical ./src layout when SrcDir is empty.
+// Callers whose workspace is already the repository root can set SrcDir to ".".
+func sourcePromptPath(j Job) string {
+	dir := strings.TrimSpace(j.SrcDir)
+	if dir == "" {
+		dir = defaultSrcDir
 	}
-	return fmt.Sprintf(" Validate ./%s against ./schema.json before finishing.", outputFile)
+	dir = filepath.ToSlash(filepath.Clean(dir))
+	if dir == "." {
+		return "the workspace root"
+	}
+	return "./" + strings.TrimPrefix(dir, "./")
 }
 
-// WriteSystemPrompt writes j.SystemPrompt to the guide file used by h. Claude
-// receives its system prompt through argv, so this function has no work for
-// that backend.
+// schemaValidationHint tells the agent to use the caller's validation endpoint
+// instead of installing a JSON Schema library inside a restricted runner. The
+// endpoint uses the schema staged with the skill, so its result matches the
+// caller's post-run validation. Non-JSON outputs do not need the instruction.
+func schemaValidationHint(outputFile string) string {
+	if !strings.HasSuffix(outputFile, ".json") {
+		return ""
+	}
+	return fmt.Sprintf(
+		" To check ./%s against ./schema.json, POST it to {scrutineer.api_base}/scans/{scrutineer.scan_id}/validate-report (header \"Authorization: Bearer {scrutineer.token}\", values in ./context.json); {\"valid\":true} means it conforms. Don't install a schema validator.",
+		outputFile,
+	)
+}
+
+// WriteSystemPrompt writes j.SystemPrompt to the guide file used by h. A
+// backend that passes the system prompt in Args has no file to write.
 func WriteSystemPrompt(h Harness, j Job) error {
-	if strings.TrimSpace(j.SystemPrompt) == "" || Name(h) == "claude" {
+	if strings.TrimSpace(j.SystemPrompt) == "" {
+		return nil
+	}
+	if h == nil {
+		return fmt.Errorf("harness: backend is required for a system prompt")
+	}
+	if h.SystemPromptViaArgs() {
 		return nil
 	}
 	if j.Workspace == "" {

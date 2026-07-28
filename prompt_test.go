@@ -4,13 +4,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestDefaultPromptBytes(t *testing.T) {
 	t.Parallel()
 
-	const validation = ` To check ./report.json against ./schema.json, POST it to {scrutineer.api_base}/scans/{scrutineer.scan_id}/validate-report (header "Authorization: Bearer {scrutineer.token}", values in ./context.json); {"valid":true} means it conforms. Don't install a schema validator.`
+	const validation = ` Validate ./report.json against ./schema.json before finishing.`
 	job := Job{SkillName: "audit", OutputFile: "report.json"}
 	tests := []struct {
 		name string
@@ -46,6 +47,18 @@ func TestDefaultPromptBytes(t *testing.T) {
 				t.Errorf("Prompt() = %q, want %q", got, test.want)
 			}
 		})
+	}
+
+	// A caller-supplied ValidationHint replaces the generic default so a
+	// caller with its own validation endpoint can steer the agent there.
+	custom := job
+	custom.ValidationHint = "POST it to http://host/validate; don't install a schema validator."
+	got := ClaudeHarness{}.Prompt(custom)
+	if !strings.HasSuffix(got, " "+custom.ValidationHint) {
+		t.Errorf("Prompt() with ValidationHint = %q, want suffix %q", got, custom.ValidationHint)
+	}
+	if strings.Contains(got, "before finishing") {
+		t.Errorf("Prompt() with ValidationHint still contains the default: %q", got)
 	}
 }
 

@@ -43,6 +43,13 @@ type Job struct {
 	// empty for free-form runs.
 	OutputFile string
 
+	// ValidationHint is appended to generated prompts after the OutputFile
+	// clause when OutputFile ends in .json. It lets a caller tell the agent
+	// how to validate its output (an API endpoint, a staged validator) in
+	// terms of the caller's own context. When empty, a generic instruction
+	// to check against ./schema.json is used.
+	ValidationHint string
+
 	// AllowedTools is Claude's comma-separated tool allowlist. Other backends
 	// leave tool restrictions to their caller's sandbox.
 	AllowedTools string

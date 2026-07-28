@@ -37,7 +37,7 @@ func explicitSkillPrompt(j Job, skillPath string) string {
 	prompt := verb + " the instructions in " + skillPath + "/SKILL.md against the repository cloned at " + sourcePromptPath(j) + "."
 	if j.OutputFile != "" {
 		prompt += " Write your structured output to ./" + j.OutputFile + " as the skill specifies."
-		prompt += schemaValidationHint(j.OutputFile)
+		prompt += schemaValidationHint(j)
 	}
 	return prompt
 }
@@ -48,7 +48,7 @@ func buildSkillPrompt(j Job) string {
 	prompt := fmt.Sprintf("Use the %q skill on the repository cloned at %s.", j.SkillName, sourcePromptPath(j))
 	if j.OutputFile != "" {
 		prompt += fmt.Sprintf(" Write your structured output to ./%s as the skill specifies.", j.OutputFile)
-		prompt += schemaValidationHint(j.OutputFile)
+		prompt += schemaValidationHint(j)
 	}
 	return prompt
 }
@@ -66,7 +66,7 @@ func buildResumePrompt(j Job) string {
 	)
 	if j.OutputFile != "" {
 		prompt += fmt.Sprintf(" Write your structured output to ./%s as the skill specifies.", j.OutputFile)
-		prompt += schemaValidationHint(j.OutputFile)
+		prompt += schemaValidationHint(j)
 	}
 	return prompt
 }
@@ -85,18 +85,18 @@ func sourcePromptPath(j Job) string {
 	return "./" + strings.TrimPrefix(dir, "./")
 }
 
-// schemaValidationHint tells the agent to use the caller's validation endpoint
-// instead of installing a JSON Schema library inside a restricted runner. The
-// endpoint uses the schema staged with the skill, so its result matches the
-// caller's post-run validation. Non-JSON outputs do not need the instruction.
-func schemaValidationHint(outputFile string) string {
-	if !strings.HasSuffix(outputFile, ".json") {
+// schemaValidationHint tells the agent to check its JSON output against the
+// staged schema.json. A caller with its own validation endpoint or tooling
+// sets Job.ValidationHint to a specific instruction; the generic default
+// covers callers with no such endpoint. Non-JSON outputs get no hint.
+func schemaValidationHint(j Job) string {
+	if !strings.HasSuffix(j.OutputFile, ".json") {
 		return ""
 	}
-	return fmt.Sprintf(
-		" To check ./%s against ./schema.json, POST it to {scrutineer.api_base}/scans/{scrutineer.scan_id}/validate-report (header \"Authorization: Bearer {scrutineer.token}\", values in ./context.json); {\"valid\":true} means it conforms. Don't install a schema validator.",
-		outputFile,
-	)
+	if j.ValidationHint != "" {
+		return " " + j.ValidationHint
+	}
+	return fmt.Sprintf(" Validate ./%s against ./schema.json before finishing.", j.OutputFile)
 }
 
 // WriteSystemPrompt writes j.SystemPrompt to the guide file used by h. A

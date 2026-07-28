@@ -184,14 +184,20 @@ h, err := harness.ByName("codex")
 if err != nil {
     return err
 }
+skill, err := skills.Parse("/skills/security-review/SKILL.md")
+if err != nil {
+    return err
+}
 job := harness.Job{
     Workspace:  "/work",
     SrcDir:     ".",
-    SkillName:  "security-review",
+    SkillName:  skill.Name,
     Model:      "gpt-5.3-codex",
     OutputFile: "report.json",
 }
-
+if err := skills.Stage(h, job, skill); err != nil {
+    return err
+}
 if err := harness.WriteSystemPrompt(h, job); err != nil {
     return err
 }
@@ -230,11 +236,7 @@ the allowlist.
 
 ## Packages
 
-`skills` parses `SKILL.md` and plain markdown instructions, walks skill
-directories, validates metadata namespaces and glob patterns, stages a skill
-for any backend, and joins instruction bodies for a system prompt. `Render`
-returns `SKILL.md` bytes for in-memory skills. A parsed skill retains a sibling
-`schema.json` in `SchemaJSON` and includes it in `SourceHash`.
+`skills` parses `SKILL.md` files following the [Agent Skills specification](https://agentskills.io/specification). YAML frontmatter is optional, so plain markdown instruction files parse too. `Parse` returns a `Skill` with the spec fields (name, description, license, compatibility, allowed-tools, metadata), the body, a sibling `schema.json` when present, and a content hash covering both. `Walk` finds skills under a directory; `Stage` writes one into the selected backend's discovery directory; `Concat` joins bodies for a system prompt; `Render` produces `SKILL.md` bytes from a `Skill` built in memory. `ValidateNamespace` and the `Match`/`PathIncluded` glob helpers support callers that add their own metadata keys and path filters.
 
 `egress` contains the authenticated allowlist proxy and
 `WriteSandboxSettings`, which writes Claude's `.claude/settings.json` domain

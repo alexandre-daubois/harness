@@ -9,6 +9,40 @@ import (
 	"testing"
 )
 
+func TestSafePromptAndSessionID(t *testing.T) {
+	if got := safePrompt("--dangerously-skip-permissions"); got[0] != ' ' {
+		t.Errorf("safePrompt on flag-shaped prompt = %q, want leading space", got)
+	}
+	if got := safePrompt("hello"); got != "hello" {
+		t.Errorf("safePrompt(plain) = %q", got)
+	}
+	if got := safeSessionID("--flag"); got != "" {
+		t.Errorf("safeSessionID on flag-shaped id = %q, want empty", got)
+	}
+	if got := safeSessionID("abc-123"); got != "abc-123" {
+		t.Errorf("safeSessionID(uuid-like) = %q", got)
+	}
+}
+
+// TestArgsGuardsTrailingPrompt pins that a Job.Prompt beginning with `-`
+// cannot become a flag on any backend that appends the prompt as a trailing
+// positional. Copilot passes it as -p <value> so is not affected either way.
+func TestArgsGuardsTrailingPrompt(t *testing.T) {
+	j := Job{Workspace: "/w", Prompt: "--dangerously-skip-permissions"}
+	for _, name := range []string{"claude", "codex", "opencode"} {
+		h, _ := ByName(name)
+		args := h.Args(j)
+		last := args[len(args)-1]
+		if strings.HasPrefix(last, "-") {
+			t.Errorf("%s: trailing arg %q is flag-shaped", name, last)
+		}
+		// The value that reaches the CLI must still contain the user's text.
+		if !strings.Contains(last, "dangerously-skip-permissions") {
+			t.Errorf("%s: prompt content lost: %q", name, last)
+		}
+	}
+}
+
 func TestRegistry(t *testing.T) {
 	t.Parallel()
 

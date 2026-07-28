@@ -73,11 +73,11 @@ func Stage(h harness.Harness, job harness.Job, skill *Skill) error {
 }
 
 func validateDestination(workspace, destination string) error {
-	root, err := filepath.Abs(workspace)
+	root, err := realAbs(workspace)
 	if err != nil {
 		return err
 	}
-	target, err := filepath.Abs(destination)
+	target, err := realAbs(destination)
 	if err != nil {
 		return err
 	}
@@ -89,6 +89,37 @@ func validateDestination(workspace, destination string) error {
 		return fmt.Errorf("skills: destination %q is outside the workspace", destination)
 	}
 	return nil
+}
+
+// realAbs resolves symlinks in the deepest existing ancestor of p and returns
+// the absolute path with the not-yet-existing tail rejoined. filepath.Abs
+// alone does not follow symlinks, so a workspace containing e.g.
+// .claude/skills -> /victim (from a repo cloned as the workspace root with
+// symlinks preserved) would otherwise pass validateDestination while
+// os.RemoveAll and WriteFile follow the link.
+func realAbs(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	existing := abs
+	var tail []string
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			break
+		}
+		tail = append([]string{filepath.Base(existing)}, tail...)
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			break
+		}
+		existing = parent
+	}
+	resolved, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(append([]string{resolved}, tail...)...), nil
 }
 
 func copySiblings(source, destination string) error {
@@ -144,11 +175,10 @@ func copyTree(source, destination string) error {
 		}
 		return nil
 	case info.Mode()&os.ModeSymlink != 0:
-		target, err := os.Readlink(source)
-		if err != nil {
-			return err
-		}
-		return os.Symlink(target, destination)
+		// A skill source directory containing foo -> /etc or
+		// foo -> ../../../.. would otherwise be staged as a live outward
+		// symlink into the agent's workspace. Refuse rather than recreate.
+		return fmt.Errorf("symlink %q not staged", source)
 	case info.Mode().IsRegular():
 		return copyFile(source, destination, info.Mode().Perm())
 	default:

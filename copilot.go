@@ -36,8 +36,8 @@ func (CopilotHarness) Args(j Job) []string {
 	if j.Model != "" {
 		args = append(args, "--model", j.Model)
 	}
-	if j.ResumeSessionID != "" {
-		args = append(args, "--resume="+j.ResumeSessionID)
+	if id := safeSessionID(j.ResumeSessionID); id != "" {
+		args = append(args, "--resume="+id)
 	}
 	return args
 }

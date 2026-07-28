@@ -40,15 +40,15 @@ func (ClaudeHarness) Args(j Job) []string {
 	if j.Effort != "" {
 		args = append(args, "--effort", j.Effort)
 	}
-	if j.ResumeSessionID != "" {
-		args = append(args, "--resume", j.ResumeSessionID)
+	if id := safeSessionID(j.ResumeSessionID); id != "" {
+		args = append(args, "--resume", id)
 	}
 	maxTurns := j.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = DefaultMaxTurns
 	}
 	args = append(args, "--max-turns", strconv.Itoa(maxTurns))
-	return append(args, ClaudeHarness{}.Prompt(j))
+	return append(args, "--", safePrompt(ClaudeHarness{}.Prompt(j)))
 }
 
 // claudePermissionMode selects the mode for a job with an allowed-tools list.

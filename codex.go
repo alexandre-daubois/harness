@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"io"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -22,7 +21,7 @@ func (CodexHarness) Binary() string { return "codex" }
 func (CodexHarness) Args(j Job) []string {
 	var args []string
 	if j.BaseURL != "" {
-		args = append(args, "-c", "openai_base_url="+strconv.Quote(j.BaseURL))
+		args = append(args, "-c", "openai_base_url="+codexConfigValue(j.BaseURL))
 	}
 	args = append(args,
 		"exec",
@@ -37,10 +36,23 @@ func (CodexHarness) Args(j Job) []string {
 	if j.Model != "" {
 		args = append(args, "--model", j.Model)
 	}
-	if j.ResumeSessionID != "" {
-		args = append(args, "resume", j.ResumeSessionID)
+	if id := safeSessionID(j.ResumeSessionID); id != "" {
+		args = append(args, "resume", id)
 	}
-	return append(args, CodexHarness{}.Prompt(j))
+	return append(args, "--", safePrompt(CodexHarness{}.Prompt(j)))
+}
+
+// codexConfigValue quotes s for a codex -c key=<value> TOML fragment. A URL
+// should never contain characters outside TOML's basic-string subset; if it
+// does, an empty value is safer than one that could break out of the string
+// and set a second key.
+func codexConfigValue(s string) string {
+	for _, r := range s {
+		if r < 0x20 || r == '"' || r == '\\' || r == 0x7f {
+			return `""`
+		}
+	}
+	return `"` + s + `"`
 }
 
 func (CodexHarness) Prompt(j Job) string {

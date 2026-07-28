@@ -3,6 +3,7 @@ package egress
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -197,7 +198,26 @@ func (p *Proxy) checkAuth(r *http.Request) bool {
 		return false
 	}
 	_, pass, ok := decodeBasic(h[len(prefix):])
-	return ok && pass == p.Token
+	return ok && subtle.ConstantTimeCompare([]byte(pass), []byte(p.Token)) == 1
+}
+
+// apiHostGate rejects a request for an API host when APIPort is unset or the
+// request targets a different port. Without the empty-APIPort check, the
+// zero-value Proxy grants CONNECT host.docker.internal:<any>, dialTarget
+// rewrites that to 127.0.0.1:<any>, and the api-gateway path bypasses
+// egressIPControl — giving a container full host-loopback reach.
+func (p *Proxy) apiHostGate(w http.ResponseWriter, method, host, port string) bool {
+	switch {
+	case p.APIPort == "":
+		p.Log.Warn("egress denied", "method", method, "host", host, "reason", "APIPort unset")
+		http.Error(w, "egress to "+host+" is denied: APIPort not configured", http.StatusForbidden)
+		return false
+	case port != p.APIPort:
+		p.Log.Warn("egress denied", "method", method, "host", host, "port", port, "allowed_port", p.APIPort)
+		http.Error(w, "egress to "+host+" is only allowed on port "+p.APIPort, http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
@@ -208,9 +228,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apiHost := p.isAPIHost(host)
-	if apiHost && p.APIPort != "" && port != p.APIPort {
-		p.Log.Warn("egress denied", "method", "CONNECT", "host", host, "port", port, "allowed_port", p.APIPort)
-		http.Error(w, "egress to "+host+" is only allowed on port "+p.APIPort, http.StatusForbidden)
+	if apiHost && !p.apiHostGate(w, "CONNECT", host, port) {
 		return
 	}
 	upstream, err := dialEgress(r.Context(), "tcp", p.dialTarget(host, port), apiHost)
@@ -249,9 +267,7 @@ func (p *Proxy) serveForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apiHost := p.isAPIHost(host)
-	if apiHost && p.APIPort != "" && port != p.APIPort {
-		p.Log.Warn("egress denied", "method", r.Method, "host", host, "port", port, "allowed_port", p.APIPort)
-		http.Error(w, "egress to "+host+" is only allowed on port "+p.APIPort, http.StatusForbidden)
+	if apiHost && !p.apiHostGate(w, r.Method, host, port) {
 		return
 	}
 	out := r.Clone(r.Context())
@@ -260,8 +276,7 @@ func (p *Proxy) serveForward(w http.ResponseWriter, r *http.Request) {
 	if apiHost {
 		out = out.WithContext(context.WithValue(out.Context(), apiGatewayDialKey{}, true))
 	}
-	out.Header.Del("Proxy-Authorization")
-	out.Header.Del("Proxy-Connection")
+	stripHopByHop(out.Header)
 	resp, err := p.transport.RoundTrip(out)
 	if err != nil {
 		if p.writeIPDenied(w, r.Method, host, err) {
@@ -271,6 +286,7 @@ func (p *Proxy) serveForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
+	stripHopByHop(resp.Header)
 	maps.Copy(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
@@ -298,11 +314,34 @@ func dialEgress(ctx context.Context, network, address string, apiGateway bool) (
 	return dialer.DialContext(ctx, network, address)
 }
 
-// cgnatPrefix is RFC 6598 shared address space (100.64.0.0/10). netip.Addr's
-// IsPrivate reports false for it, but carrier-grade NAT and overlay networks
-// such as Tailscale and ZeroTier route it, so a rebind into that range must be
-// denied alongside RFC1918.
-var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+// deniedPrefixes are ranges netip.Addr's Is* predicates do not cover but
+// which must be denied alongside loopback, private, link-local, unspecified,
+// and multicast. Each reaches or maps to a non-public destination on some
+// stack.
+var deniedPrefixes = []netip.Prefix{
+	// RFC 6598 shared address space; carrier-grade NAT and overlay networks
+	// such as Tailscale and ZeroTier route it.
+	netip.MustParsePrefix("100.64.0.0/10"),
+	// The whole 0.0.0.0/8 block, not just 0.0.0.0. Linux has treated parts of
+	// it as loopback historically; nothing in it is a public destination.
+	netip.MustParsePrefix("0.0.0.0/8"),
+	// NAT64 well-known prefix: on a host with a translator, 64:ff9b::7f00:1
+	// reaches 127.0.0.1.
+	netip.MustParsePrefix("64:ff9b::/96"),
+	// RFC 2765 IPv4-translated (deprecated) and RFC 3879 site-local
+	// (deprecated) — neither is a public destination.
+	netip.MustParsePrefix("::ffff:0:0:0/96"),
+	netip.MustParsePrefix("fec0::/10"),
+}
+
+func inDeniedPrefix(ip netip.Addr) bool {
+	for _, p := range deniedPrefixes {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
 
 // egressIPControl checks the address selected by net.Dialer after name
 // resolution and immediately before connect. This closes the DNS rebinding
@@ -322,7 +361,7 @@ func egressIPControl(apiGateway bool) func(string, string, syscall.RawConn) erro
 			return &egressIPDeniedError{address: address}
 		}
 		ip = ip.Unmap()
-		if ip.IsLoopback() || ip.IsPrivate() || cgnatPrefix.Contains(ip) || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast() {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast() || inDeniedPrefix(ip) {
 			return &egressIPDeniedError{address: ip.String()}
 		}
 		return nil
@@ -374,6 +413,11 @@ func HostAllowed(allow []string, host string) bool {
 func Start(p *Proxy) (int, error) {
 	if p == nil {
 		return 0, errors.New("egress: proxy is required")
+	}
+	if p.Token == "" {
+		// The listener binds all interfaces; without a token this would be
+		// an open forward proxy on the LAN.
+		return 0, errors.New("egress: Token is required (use NewToken)")
 	}
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
@@ -454,9 +498,34 @@ func (p *Proxy) gatewayDialHost() string {
 // proxy sidecar uses it to listen on a fixed port inside its container; the
 // in-process host proxy uses Start instead (ephemeral port, returns
 // immediately). Both share the handler and timeouts.
+// hopByHopHeaders is the RFC 7230 section 6.1 set plus the two proxy-specific
+// headers a forward proxy must not pass to the origin. Stripped in both
+// directions so a client cannot smuggle Transfer-Encoding or Upgrade to an
+// origin that mishandles them.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func stripHopByHop(h http.Header) {
+	for _, k := range hopByHopHeaders {
+		h.Del(k)
+	}
+}
+
 func Serve(p *Proxy, addr string) error {
 	if p == nil {
 		return errors.New("egress: proxy is required")
+	}
+	if p.Token == "" {
+		return errors.New("egress: Token is required (use NewToken)")
 	}
 	p.init()
 	srv := &http.Server{Addr: addr, Handler: p, ReadHeaderTimeout: egressDialTimeout}

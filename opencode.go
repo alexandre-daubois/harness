@@ -27,10 +27,10 @@ func (OpencodeHarness) Args(j Job) []string {
 	if j.Model != "" {
 		args = append(args, "--model", j.Model)
 	}
-	if j.ResumeSessionID != "" {
-		args = append(args, "--session", j.ResumeSessionID)
+	if id := safeSessionID(j.ResumeSessionID); id != "" {
+		args = append(args, "--session", id)
 	}
-	return append(args, OpencodeHarness{}.Prompt(j))
+	return append(args, "--", safePrompt(OpencodeHarness{}.Prompt(j)))
 }
 
 func (OpencodeHarness) Prompt(j Job) string {

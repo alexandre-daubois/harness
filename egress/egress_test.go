@@ -42,7 +42,14 @@ func TestPublicHelpers(t *testing.T) {
 		}
 	}
 
-	port, err := Start(&Proxy{Log: quietLog()})
+	if _, err := Start(&Proxy{Log: quietLog()}); err == nil {
+		t.Error("Start with no Token should refuse (open relay on all interfaces)")
+	}
+	if err := Serve(&Proxy{Log: quietLog()}, "127.0.0.1:0"); err == nil {
+		t.Error("Serve with no Token should refuse")
+	}
+
+	port, err := Start(&Proxy{Log: quietLog(), Token: token})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +266,7 @@ func TestEgressProxy_SidecarForwardDialsGatewayHost(t *testing.T) {
 	defer upstream.Close()
 	host, port, _ := net.SplitHostPort(upstream.Listener.Addr().String())
 
-	p := &Proxy{Allow: []string{HostGatewayAlias}, GatewayDialHost: host, Log: quietLog()}
+	p := &Proxy{Allow: []string{HostGatewayAlias}, APIPort: port, GatewayDialHost: host, Log: quietLog()}
 	target := "http://" + net.JoinHostPort(HostGatewayAlias, port) + "/api/ping"
 	r := httptest.NewRequest("GET", target, nil)
 	w := httptest.NewRecorder()
@@ -281,7 +288,7 @@ func TestEgressProxy_ForwardAllowedRewritesCustomAPIHost(t *testing.T) {
 	_, port, _ := net.SplitHostPort(upstream.Listener.Addr().String())
 
 	const apiHost = "192.168.64.1"
-	p := &Proxy{Allow: []string{apiHost}, APIHosts: []string{apiHost}, Log: quietLog()}
+	p := &Proxy{Allow: []string{apiHost}, APIHosts: []string{apiHost}, APIPort: port, Log: quietLog()}
 	target := "http://" + net.JoinHostPort(apiHost, port) + "/api/ping"
 	r := httptest.NewRequest("GET", target, nil)
 	w := httptest.NewRecorder()
@@ -537,6 +544,10 @@ func TestEgressIPControl_DeniesNonPublicRanges(t *testing.T) {
 		"169.254.1.1",
 		"fe80::1",
 		"0.0.0.0",
+		"0.1.2.3",         // 0.0.0.0/8, not just the unspecified address
+		"64:ff9b::7f00:1", // NAT64 → 127.0.0.1
+		"::ffff:0:7f00:1", // RFC 2765 IPv4-translated (deprecated)
+		"fec0::1",         // site-local (deprecated)
 		"::",
 		"224.0.0.1",
 		"ff02::1",

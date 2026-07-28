@@ -157,6 +157,30 @@ func Names() string {
 // passthroughEnv returns each host environment key that is set. Bare entries
 // preserve the process-runner convention of passing a secret through without
 // embedding its value in argv.
+// safePrompt returns p unchanged unless it begins with `-`, in which case a
+// single leading space is prefixed so the backend CLI cannot parse it as a
+// flag. Job.Prompt and Job.ResumePrompt land in positional argv on three of
+// four backends; without this a prompt of `--dangerously-skip-permissions`
+// (Claude) or `--full-auto` (Codex) would override the permission mode Args
+// set. The space is whitespace the model ignores.
+func safePrompt(p string) string {
+	if strings.HasPrefix(p, "-") {
+		return " " + p
+	}
+	return p
+}
+
+// safeSessionID returns id unless it begins with `-`, in which case it returns
+// "" so the caller falls back to a fresh run instead of passing a flag-shaped
+// value in positional argv. Session ids captured from a KindSession event are
+// UUIDs, so this only trips on a corrupted or hostile store.
+func safeSessionID(id string) string {
+	if strings.HasPrefix(id, "-") {
+		return ""
+	}
+	return id
+}
+
 func passthroughEnv(keys ...string) []string {
 	var entries []string
 	for _, key := range keys {

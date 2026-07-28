@@ -6,6 +6,18 @@ interface while leaving process placement to the caller. A command can run on
 the host, inside a container, or through a remote runner with the same arguments
 and event parser.
 
+## Supported backends
+
+| Name | Binary | Credential environment | Skill directory | Project instructions | Model API hosts |
+| --- | --- | --- | --- | --- | --- |
+| `claude` | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` | `.claude/skills/<name>` | `CLAUDE.md` | `*.anthropic.com` |
+| `codex` | `codex` | `CODEX_API_KEY` | `skills/<name>` | `AGENTS.md` | `api.openai.com`, `auth0.openai.com`, `chatgpt.com` |
+| `copilot` | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | `.github/skills/<name>` | `.github/copilot-instructions.md` | `github.com`, `api.github.com`, `api.mcp.github.com`, `*.githubcopilot.com` |
+| `opencode` | `opencode` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_AUTH_CONTENT` | `.opencode/skill/<name>` | `AGENTS.md` | `models.dev`, `api.openai.com`, `*.anthropic.com` |
+
+The Copilot parser targets CLI 1.0.75 or later, where
+`--output-format json` emits JSONL in prompt mode.
+
 The library owns the details that differ between CLIs: binary names, arguments,
 credential and state environment variables, project instruction files, skill
 directories, model API hosts, JSONL parsing, account-limit errors, default
@@ -208,18 +220,6 @@ checks the resolved destination immediately before connecting and rejects
 loopback, private, link-local, carrier-grade NAT, unspecified, and multicast
 addresses. This closes the usual DNS rebinding path after a hostname has passed
 the allowlist.
-
-## Backends
-
-| Name | Binary | Credential environment | Skill directory | Project instructions | Model API hosts |
-| --- | --- | --- | --- | --- | --- |
-| `claude` | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` | `.claude/skills/<name>` | `CLAUDE.md` | `*.anthropic.com` |
-| `codex` | `codex` | `CODEX_API_KEY` | `skills/<name>` | `AGENTS.md` | `api.openai.com`, `auth0.openai.com`, `chatgpt.com` |
-| `copilot` | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | `.github/skills/<name>` | `.github/copilot-instructions.md` | `github.com`, `api.github.com`, `api.mcp.github.com`, `*.githubcopilot.com` |
-| `opencode` | `opencode` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_AUTH_CONTENT` | `.opencode/skill/<name>` | `AGENTS.md` | `models.dev`, `api.openai.com`, `*.anthropic.com` |
-
-The Copilot parser targets CLI 1.0.75 or later, where
-`--output-format json` emits JSONL in prompt mode.
 
 ## Packages
 

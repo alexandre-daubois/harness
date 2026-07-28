@@ -1,0 +1,240 @@
+# harness
+
+`harness` is a Go library for driving AI coding CLIs in headless mode. It
+supports Claude Code, Codex, GitHub Copilot CLI, and OpenCode through one
+interface while leaving process placement to the caller. A command can run on
+the host, inside a container, or through a remote runner with the same arguments
+and event parser.
+
+The library owns the details that differ between CLIs: binary names, arguments,
+credential and state environment variables, project instruction files, skill
+directories, model API hosts, JSONL parsing, account-limit errors, default
+models, and token prices.
+
+## Install
+
+```sh
+go get github.com/alpha-omega-security/harness
+```
+
+Go 1.26 or later is required.
+
+## Core API
+
+A `Job` contains resolved values for one invocation. Callers apply their own
+configuration defaults before constructing it.
+
+```go
+type Job struct {
+    Workspace string
+    SkillName string
+
+    Prompt       string
+    SystemPrompt string
+
+    Model    string
+    Effort   string
+    MaxTurns int
+
+    OutputFile  string
+    AllowedTools string
+    BaseURL      string
+
+    ResumeSessionID string
+    ResumePrompt    string
+}
+```
+
+`Workspace` is the command's working directory. `SkillName` selects a staged
+`SKILL.md`; when `Prompt` is empty, the backend builds a short activation
+prompt. `SystemPrompt` uses `--system-prompt` with Claude and the backend's
+project instruction file for the other CLIs.
+
+`MaxTurns` uses the backend default when set to zero. `Effort` and
+`AllowedTools` currently apply only to Claude. `ResumeSessionID` and
+`ResumePrompt` continue an existing conversation.
+
+The `Harness` interface exposes the parts needed by local, container, and remote
+runners:
+
+```go
+type Harness interface {
+    Binary() string
+    Args(Job) []string
+    Prompt(Job) string
+    ParseStream(io.Reader, func(Event))
+    SkillDir(workspace, name string) string
+    GuideFilename() string
+    EgressHosts() []string
+    Env(baseURL string) []string
+    StateEnv(dir string) []string
+    AccountErrorText(string) string
+    DefaultModels() []ModelDefault
+}
+```
+
+Use `ByName` to select a backend. An empty name selects Claude.
+
+```go
+h, err := harness.ByName("codex")
+name := harness.Name(h)
+available := harness.Names() // "claude, codex, copilot, opencode"
+```
+
+Each parser produces the same event type:
+
+```go
+type Event struct {
+    Kind      string
+    Tool      string
+    Text      string
+    CostUSD   float64
+    Turns     int
+    Usage     Usage
+    SessionID string
+    RateLimit *RateLimitInfo
+}
+```
+
+Kinds are `thinking`, `text`, `tool`, `result`, `error`, `session`, and
+`rate_limit`. `FormatEvent` renders an event for a plain-text log.
+`CostFromUsage` calculates a list-price estimate when the CLI reports tokens
+without a dollar amount.
+
+## Run a local subprocess
+
+`Run` starts the selected binary in the workspace, applies its environment,
+writes a project instruction file when needed, and parses combined output as it
+arrives.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    "github.com/alpha-omega-security/harness"
+    "github.com/alpha-omega-security/harness/egress"
+    "github.com/alpha-omega-security/harness/skills"
+)
+
+func main() {
+    ctx := context.Background()
+    workspace := "/work/project"
+
+    h, err := harness.ByName("claude")
+    if err != nil {
+        log.Fatal(err)
+    }
+    instructions, err := skills.Parse("/work/instructions/review.md")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    job := harness.Job{
+        Workspace:    workspace,
+        Prompt:       "Review this project for security defects.",
+        SystemPrompt: skills.Concat(instructions),
+        Model:        "claude-sonnet-4-6",
+        MaxTurns:     20,
+    }
+
+    if err := egress.WriteSandboxSettings(workspace, h.EgressHosts()); err != nil {
+        log.Fatal(err)
+    }
+    err = harness.Run(ctx, h, job, func(event harness.Event) {
+        fmt.Println(harness.FormatEvent(event))
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+When a non-zero exit contains a provider account-limit message, `Run` returns
+an `*harness.AccountError`. Its optional reset time can be used to schedule a
+later retry.
+
+## Use another process runner
+
+Callers that own process creation can use the same API without `Run`. This is
+useful for containers, job queues, and remote execution.
+
+```go
+h, err := harness.ByName("codex")
+if err != nil {
+    return err
+}
+job := harness.Job{
+    Workspace:  "/work",
+    SkillName:  "security-review",
+    Model:      "gpt-5.3-codex",
+    OutputFile: "report.json",
+}
+
+if err := harness.WriteSystemPrompt(h, job); err != nil {
+    return err
+}
+argv := append([]string{h.Binary()}, h.Args(job)...)
+env := append(h.Env(job.BaseURL), h.StateEnv("/state")...)
+
+// Pass argv and env to the process runner. Entries such as "CODEX_API_KEY"
+// use the `docker run -e KEY` passthrough form.
+stdout, err := startContainer(ctx, argv, env)
+if err != nil {
+    return err
+}
+h.ParseStream(stdout, func(event harness.Event) {
+    fmt.Println(harness.FormatEvent(event))
+})
+```
+
+`WriteSystemPrompt` is needed only when `SystemPrompt` is non-empty. Claude
+receives that value in its arguments, so the helper does not write `CLAUDE.md`.
+
+## Process isolation
+
+The generated arguments allow unattended tool use. Claude uses
+`bypassPermissions` unless `AllowedTools` is set. Codex uses
+`danger-full-access`, OpenCode uses `--auto`, and Copilot uses `--allow-all`.
+Run these commands only in a workspace and execution environment where those
+permissions are acceptable. Container and remote callers should apply their
+own filesystem, process, secret, and network limits.
+
+The `egress` package can restrict outbound HTTP and HTTPS by hostname. Its proxy
+checks the resolved destination immediately before connecting and rejects
+loopback, private, link-local, carrier-grade NAT, unspecified, and multicast
+addresses. This closes the usual DNS rebinding path after a hostname has passed
+the allowlist.
+
+## Backends
+
+| Name | Binary | Credential environment | Skill directory | Project instructions | Model API hosts |
+| --- | --- | --- | --- | --- | --- |
+| `claude` | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` | `.claude/skills/<name>` | `CLAUDE.md` | `*.anthropic.com` |
+| `codex` | `codex` | `CODEX_API_KEY` | `skills/<name>` | `AGENTS.md` | `api.openai.com`, `auth0.openai.com`, `chatgpt.com` |
+| `copilot` | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | `.github/skills/<name>` | `.github/copilot-instructions.md` | `github.com`, `api.github.com`, `api.mcp.github.com`, `*.githubcopilot.com` |
+| `opencode` | `opencode` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_AUTH_CONTENT` | `.opencode/skill/<name>` | `AGENTS.md` | `models.dev`, `api.openai.com`, `*.anthropic.com` |
+
+The Copilot parser targets CLI 1.0.75 or later, where
+`--output-format json` emits JSONL in prompt mode.
+
+## Packages
+
+`skills` parses `SKILL.md` and plain markdown instructions, walks skill
+directories, validates metadata namespaces and glob patterns, stages a skill
+for any backend, and joins instruction bodies for a system prompt.
+
+`egress` contains the authenticated allowlist proxy and
+`WriteSandboxSettings`, which writes Claude's `.claude/settings.json` domain
+allowlist.
+
+`llm` sends a single schema-constrained request to the Anthropic Messages API.
+It accepts a caller-owned HTTP client and permits plain HTTP only for local
+development endpoints.
+
+## License
+
+MIT

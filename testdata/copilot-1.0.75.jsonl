@@ -1,0 +1,6 @@
+{"type":"assistant.reasoning","data":{"reasoningId":"reasoning-1","content":"Checking the workspace."}}
+{"type":"tool.execution_start","data":{"toolCallId":"tool-1","toolName":"shell","arguments":{"command":"go test ./..."}}}
+{"type":"assistant.message","data":{"messageId":"message-1","model":"claude-sonnet-4.6","content":"Done.","toolRequests":[],"turnId":"0","outputTokens":4}}
+{"type":"assistant.usage","data":{"model":"claude-sonnet-4.6","inputTokens":120,"outputTokens":4,"cacheReadTokens":80,"cacheWriteTokens":10}}
+{"type":"assistant.turn_end","data":{"turnId":"0"}}
+{"type":"result","sessionId":"34870a09-5067-4978-97bc-10d0d112ef64","exitCode":0,"usage":{"premiumRequests":1}}

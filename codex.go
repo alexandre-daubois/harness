@@ -68,7 +68,7 @@ func (CodexHarness) ParseStream(r io.Reader, emit func(Event)) {
 }
 
 // codexLine contains the fields used from codex exec --json. These shapes were
-// verified against Codex 0.142.5. Unknown event types remain visible as text
+// verified against Codex 0.147.0. Unknown event types remain visible as text
 // instead of being silently dropped.
 type codexLine struct {
 	Type      string          `json:"type"`
@@ -85,13 +85,19 @@ type codexLine struct {
 }
 
 type codexItem struct {
-	Type    string          `json:"type"`
-	Text    string          `json:"text"`
-	Message string          `json:"message"`
-	Command string          `json:"command"`
-	Tool    string          `json:"tool"`
-	Name    string          `json:"name"`
-	Input   json.RawMessage `json:"input"`
+	Type    string            `json:"type"`
+	Text    string            `json:"text"`
+	Message string            `json:"message"`
+	Command string            `json:"command"`
+	Tool    string            `json:"tool"`
+	Name    string            `json:"name"`
+	Input   json.RawMessage   `json:"input"`
+	Query   string            `json:"query"`
+	Changes []codexFileChange `json:"changes"`
+}
+
+type codexFileChange struct {
+	Path string `json:"path"`
 }
 
 // codexUsage is the turn.completed token breakdown.
@@ -176,7 +182,8 @@ func isCodexSessionEvent(event codexLine) bool {
 }
 
 func isCodexToolItem(itemType string) bool {
-	return strings.Contains(itemType, "command") || strings.Contains(itemType, "tool")
+	return strings.Contains(itemType, "command") || strings.Contains(itemType, "tool") ||
+		itemType == "web_search" || itemType == "file_change"
 }
 
 func codexToolName(item *codexItem) string {
@@ -194,6 +201,16 @@ func codexToolName(item *codexItem) string {
 func codexToolText(item *codexItem) string {
 	if item.Command != "" {
 		return item.Command
+	}
+	if item.Query != "" {
+		return item.Query
+	}
+	if len(item.Changes) > 0 {
+		paths := make([]string, 0, len(item.Changes))
+		for _, change := range item.Changes {
+			paths = append(paths, change.Path)
+		}
+		return strings.Join(paths, ", ")
 	}
 	return summariseInput(codexToolName(item), item.Input)
 }

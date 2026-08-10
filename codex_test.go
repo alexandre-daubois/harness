@@ -42,3 +42,43 @@ func TestCodexArgsAndStream(t *testing.T) {
 		t.Errorf("result event = %+v", events[3])
 	}
 }
+
+func TestCodexToolItems(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		tool  string
+		text  string
+	}{
+		{
+			name:  "web search",
+			input: `{"type":"item.completed","item":{"id":"item_19","type":"web_search","query":"codex exec json events","action":{"type":"search","query":"codex exec json events"}}}`,
+			tool:  "web_search",
+			text:  "codex exec json events",
+		},
+		{
+			name:  "file change",
+			input: `{"type":"item.completed","item":{"id":"item_22","type":"file_change","changes":[{"path":"/tmp/tests.json","kind":"add"},{"path":"/tmp/codex.go","kind":"update"}],"status":"completed"}}`,
+			tool:  "file_change",
+			text:  "/tmp/tests.json, /tmp/codex.go",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var events []Event
+			CodexHarness{}.ParseStream(strings.NewReader(test.input), func(event Event) {
+				events = append(events, event)
+			})
+			if len(events) != 1 {
+				t.Fatalf("got %d events: %+v", len(events), events)
+			}
+			if events[0].Kind != KindTool || events[0].Tool != test.tool || events[0].Text != test.text {
+				t.Errorf("tool event = %+v", events[0])
+			}
+		})
+	}
+}

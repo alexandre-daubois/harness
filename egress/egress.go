@@ -108,6 +108,8 @@ var DefaultAllow = []string{
 	"fastapi.metacpan.org",
 	"cpan.metacpan.org",
 	"www.cpan.org",
+	// opam (OCaml)
+	"opam.ocaml.org",
 	// CRAN (R)
 	"cran.r-project.org",
 	// Homebrew

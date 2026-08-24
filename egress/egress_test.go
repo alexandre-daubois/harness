@@ -647,6 +647,7 @@ func TestDefaultEgressAllowCoversSkillHosts(t *testing.T) {
 		"commits.ecosyste.ms",
 		"issues.ecosyste.ms",
 		"github.com",
+		"release-assets.githubusercontent.com",
 		"gitlab.com",
 		"registry.npmjs.org",
 		"api.npmjs.org",

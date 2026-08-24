@@ -49,6 +49,7 @@ var DefaultAllow = []string{
 	"api.github.com",
 	"raw.githubusercontent.com",
 	"objects.githubusercontent.com",
+	"release-assets.githubusercontent.com",
 	"codeload.github.com",
 	"gitlab.com",
 	"codeberg.org",

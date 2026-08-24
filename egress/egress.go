@@ -108,6 +108,11 @@ var DefaultAllow = []string{
 	"fastapi.metacpan.org",
 	"cpan.metacpan.org",
 	"www.cpan.org",
+	// opam (OCaml) -- the package index is a git clone of
+	// github.com/ocaml/opam-repository so it comes over the forges above;
+	// opam.ocaml.org serves the archive-cache fallback for source tarballs
+	// whose primary URL is unreachable.
+	"opam.ocaml.org",
 	// CRAN (R)
 	"cran.r-project.org",
 	// Homebrew

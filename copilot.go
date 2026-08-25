@@ -70,8 +70,8 @@ func copilotAvailableTools(j Job) string {
 		return ""
 	}
 	raw := strings.Split(j.AllowedTools, ",")
-	tools := make([]string, 0, len(raw)+2)
-	seen := make(map[string]struct{}, len(raw)+2)
+	var tools []string
+	seen := make(map[string]struct{})
 	appendTool := func(name string) {
 		if _, ok := seen[name]; ok {
 			return

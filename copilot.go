@@ -52,24 +52,50 @@ func (CopilotHarness) Args(j Job) []string {
 	return args
 }
 
+var copilotClaudeToolAliases = map[string][]string{
+	"Bash":      {"bash", "read_bash", "stop_bash", "list_bash"},
+	"Edit":      {"edit"},
+	"Glob":      {"glob"},
+	"Grep":      {"grep"},
+	"Read":      {"view"},
+	"Skill":     {"skill"},
+	"Task":      {"task", "read_agent", "list_agents", "write_agent"},
+	"WebFetch":  {"web_fetch"},
+	"WebSearch": {"web_search"},
+	"Write":     {"create", "edit"},
+}
+
 func copilotAvailableTools(j Job) string {
 	if strings.TrimSpace(j.AllowedTools) == "" {
 		return ""
 	}
 	raw := strings.Split(j.AllowedTools, ",")
-	tools := make([]string, 0, len(raw)+1)
-	hasSkill := false
+	tools := make([]string, 0, len(raw)+2)
+	seen := make(map[string]struct{}, len(raw)+2)
+	appendTool := func(name string) {
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		tools = append(tools, name)
+	}
 	for _, name := range raw {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
-		tools = append(tools, name)
-		hasSkill = hasSkill || strings.EqualFold(name, "skill")
+		aliases, ok := copilotClaudeToolAliases[name]
+		if !ok {
+			aliases = []string{name}
+		}
+		for _, alias := range aliases {
+			appendTool(alias)
+		}
 	}
-	if j.SkillName != "" && !hasSkill {
-		tools = append(tools, "skill")
+	if j.SkillName != "" {
+		appendTool("skill")
 	}
+	appendTool("task_complete")
 	return strings.Join(tools, ",")
 }
 

@@ -72,9 +72,10 @@ for the other CLIs.
 
 `MaxTurns` uses the backend default when set to zero; Copilot maps it to maximum
 autopilot continuations. `Effort` applies to Claude and Copilot.
-`AllowedTools` is a comma-separated list of backend-native tool names enforced
-by Claude and Copilot; callers must not reuse one backend's tool names for
-another. `ResumeSessionID` and `ResumePrompt` continue an existing conversation.
+`AllowedTools` is a comma-separated list of Claude Code tool names. Claude uses
+it directly; Copilot translates common built-ins such as `Read`, `Write`, and
+`Bash` to its native tools and passes unknown names through. `ResumeSessionID`
+and `ResumePrompt` continue an existing conversation.
 
 The `Harness` interface exposes the parts needed by local, container, and remote
 runners:
@@ -233,11 +234,11 @@ arguments, so the helper does not write a guide file.
 The generated arguments allow unattended tool use. Claude uses
 `bypassPermissions` unless `AllowedTools` is set. Codex uses
 `danger-full-access`, OpenCode uses `--auto`, and Copilot uses `--allow-all`;
-Copilot's `AllowedTools` filter limits which tools the model sees but does not
-narrow path or URL permissions for those tools. Run these commands only in a
-workspace and execution environment where those permissions are acceptable.
-Container and remote callers should apply their own filesystem, process,
-secret, and network limits.
+Copilot translates `AllowedTools` into an availability filter that limits which
+tools the model sees but does not narrow path or URL permissions for those
+tools. Run these commands only in a workspace and execution environment where
+those permissions are acceptable. Container and remote callers should apply
+their own filesystem, process, secret, and network limits.
 
 The `egress` package can restrict outbound HTTP and HTTPS by hostname. Its proxy
 checks the resolved destination immediately before connecting and rejects

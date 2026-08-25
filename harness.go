@@ -52,9 +52,9 @@ type Job struct {
 	// to check against ./schema.json is used.
 	ValidationHint string
 
-	// AllowedTools is a comma-separated backend-native tool allowlist. Claude
-	// and Copilot enforce it; other backends leave tool restrictions to their
-	// caller's sandbox.
+	// AllowedTools is a comma-separated Claude Code tool allowlist. Claude uses
+	// it directly; Copilot translates common built-in names and passes unknown
+	// names through. Other backends leave restrictions to the caller's sandbox.
 	AllowedTools string
 
 	// BaseURL overrides the model API endpoint where the backend supports it.

@@ -748,6 +748,7 @@ func (CopilotHarness) Env(baseURL string) []string {
 	if baseURL != "" {
 		env = append(env, "COPILOT_PROVIDER_BASE_URL="+baseURL)
 		env = append(env, passthroughEnv(
+			"COPILOT_MODEL",
 			"COPILOT_PROVIDER_API_KEY",
 			"COPILOT_PROVIDER_BEARER_TOKEN",
 			"COPILOT_PROVIDER_TYPE",

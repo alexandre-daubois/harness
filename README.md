@@ -123,9 +123,11 @@ type Event struct {
 Kinds are `thinking`, `text`, `tool`, `result`, `error`, `session`, and
 `rate_limit`. `FormatEvent` renders an event for a plain-text log.
 `CostFromUsage` calculates a list-price estimate when the CLI reports tokens
-without a dollar amount. Copilot 1.0.80 instead exposes cumulative nano-AIU
-billing checkpoints; the parser uses the latest checkpoint and converts AI
-credits to `CostUSD`.
+without a dollar amount. Copilot prefers invocation-scoped nano-AIU billing
+from `assistant.usage`; prompt mode currently omits those records, so the parser
+falls back to the latest cumulative session checkpoint. Consequently, on a
+resumed Copilot session `CostUSD` is session-cumulative when no per-call billing
+records are present.
 
 ## Run a local subprocess
 

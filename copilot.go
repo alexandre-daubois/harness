@@ -95,7 +95,6 @@ func copilotAvailableTools(j Job) string {
 	if j.SkillName != "" {
 		appendTool("skill")
 	}
-	appendTool("task_complete")
 	return strings.Join(tools, ",")
 }
 
@@ -117,6 +116,12 @@ func (CopilotHarness) ParseStream(r io.Reader, emit func(Event)) {
 		if state.sawUsageCheckpoint {
 			state.result.CostUSD = state.checkpointCostUSD
 		}
+		// Per-call billing is scoped to this invocation, unlike a checkpoint
+		// restored from an earlier lifetime of a resumed session.
+		if state.sawBilledUsage {
+			state.result.CostUSD = state.billedCostUSD
+		}
+		state.result.Usage.OutputTokens += state.unreportedMessageOutputTokenTotal()
 		emit(state.result)
 	}
 }
@@ -127,18 +132,27 @@ type copilotLine struct {
 	Type      string          `json:"type"`
 	Data      json.RawMessage `json:"data"`
 	AgentID   string          `json:"agentId"`
+	ID        string          `json:"id"`
+	ParentID  string          `json:"parentId"`
 	SessionID string          `json:"sessionId"`
 	ExitCode  *int            `json:"exitCode"`
 }
 
 type copilotStreamState struct {
-	result             Event
-	resultAPICallID    string
-	resultChunks       []string
-	estimatedCostUSD   float64
-	checkpointCostUSD  float64
-	sawUsageCheckpoint bool
-	sawTerminal        bool
+	result                Event
+	resultAPICallID       string
+	resultChunks          []string
+	messageReasoning      map[string]string
+	messageOutputTokens   map[string]int
+	usageOutputAPICalls   map[string]struct{}
+	unkeyedOutputTokens   int
+	sawUnkeyedUsageOutput bool
+	estimatedCostUSD      float64
+	checkpointCostUSD     float64
+	billedCostUSD         float64
+	sawUsageCheckpoint    bool
+	sawBilledUsage        bool
+	sawTerminal           bool
 }
 
 type copilotMessageData struct {
@@ -146,6 +160,8 @@ type copilotMessageData struct {
 	ChunkCount    *int   `json:"chunkCount"`
 	ChunkIndex    *int   `json:"chunkIndex"`
 	Content       string `json:"content"`
+	MessageID     string `json:"messageId"`
+	OutputTokens  *int   `json:"outputTokens"`
 	ReasoningText string `json:"reasoningText"`
 }
 
@@ -167,12 +183,18 @@ type copilotTurnData struct {
 }
 
 type copilotUsageData struct {
+	APICallID        string                          `json:"apiCallId"`
 	Model            string                          `json:"model"`
-	InputTokens      int                             `json:"inputTokens"`
-	OutputTokens     int                             `json:"outputTokens"`
-	CacheReadTokens  int                             `json:"cacheReadTokens"`
-	CacheWriteTokens int                             `json:"cacheWriteTokens"`
+	InputTokens      *int                            `json:"inputTokens"`
+	OutputTokens     *int                            `json:"outputTokens"`
+	CacheReadTokens  *int                            `json:"cacheReadTokens"`
+	CacheWriteTokens *int                            `json:"cacheWriteTokens"`
+	CopilotUsage     *copilotBilledUsage             `json:"copilotUsage"`
 	QuotaSnapshots   map[string]copilotQuotaSnapshot `json:"quotaSnapshots"`
+}
+
+type copilotBilledUsage struct {
+	TotalNanoAIU float64 `json:"totalNanoAiu"`
 }
 
 type copilotUsageCheckpointData struct {
@@ -203,6 +225,16 @@ type copilotInfoData struct {
 	Message string `json:"message"`
 }
 
+type copilotModelCallFailureData struct {
+	ErrorCode      string                          `json:"errorCode"`
+	ErrorMessage   string                          `json:"errorMessage"`
+	ErrorType      string                          `json:"errorType"`
+	FailureKind    string                          `json:"failureKind"`
+	Model          string                          `json:"model"`
+	QuotaSnapshots map[string]copilotQuotaSnapshot `json:"quotaSnapshots"`
+	StatusCode     *int                            `json:"statusCode"`
+}
+
 func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
 	line := strings.TrimSpace(string(raw))
 	if line == "" {
@@ -217,13 +249,15 @@ func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
 	case "assistant.message":
 		state.handleMessage(&event, line, emit)
 	case "assistant.reasoning":
-		handleCopilotReasoning(&event, line, emit)
+		state.handleReasoning(&event, line, emit)
 	case "assistant.intent":
 		handleCopilotIntent(&event, line, emit)
 	case "tool.execution_start":
 		handleCopilotTool(&event, line, emit)
 	case "assistant.usage":
 		state.handleUsage(event.Data, line, emit)
+	case "model.call_failure":
+		handleCopilotModelCallFailure(event.Data, line, emit)
 	case "session.usage_checkpoint":
 		state.handleUsageCheckpoint(event.Data, line, emit)
 	case "assistant.turn_end":
@@ -234,7 +268,7 @@ func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
 		emitCopilotError(event.Data, line, emit)
 	case "abort":
 		emitCopilotAbort(event.Data, line, emit)
-	case "session.info":
+	case "session.info", "session.warning":
 		handleCopilotInfo(event.Data, line, emit)
 	case "assistant.message_delta",
 		"assistant.message_start",
@@ -245,10 +279,14 @@ func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
 		"assistant.idle",
 		"model.call_start",
 		"model.call_end",
+		"mcp.prompts.list_changed",
+		"mcp.resources.list_changed",
+		"mcp.tools.list_changed",
 		"session.idle",
 		"session.mcp_server_status_changed",
 		"session.mcp_servers_loaded",
 		"session.skills_loaded",
+		"session.task_complete",
 		"session.tools_updated",
 		"session.usage_info",
 		"tool.execution_complete",
@@ -265,12 +303,28 @@ func (state *copilotStreamState) handleMessage(
 	fallback string,
 	emit func(Event),
 ) {
-	if event.AgentID == "" {
-		state.emitMessage(event.Data, fallback, emit)
+	var data copilotMessageData
+	if !decodeCopilotData(event.Data, &data, fallback, emit) {
+		return
 	}
+	state.recordMessageOutput(data)
+	if event.AgentID != "" {
+		return
+	}
+	if event.ID != "" && data.ReasoningText != "" {
+		if state.messageReasoning == nil {
+			state.messageReasoning = make(map[string]string)
+		}
+		state.messageReasoning[event.ID] = data.ReasoningText
+	}
+	state.emitMessage(data, emit)
 }
 
-func handleCopilotReasoning(event *copilotLine, fallback string, emit func(Event)) {
+func (state *copilotStreamState) handleReasoning(
+	event *copilotLine,
+	fallback string,
+	emit func(Event),
+) {
 	if event.AgentID != "" {
 		return
 	}
@@ -281,6 +335,14 @@ func handleCopilotReasoning(event *copilotLine, fallback string, emit func(Event
 	if data.Content == "" {
 		emit(Event{Kind: KindText, Text: fallback})
 		return
+	}
+	if event.ParentID != "" {
+		if reasoning, ok := state.messageReasoning[event.ParentID]; ok {
+			delete(state.messageReasoning, event.ParentID)
+			if data.Content == reasoning {
+				return
+			}
+		}
 	}
 	emit(Event{Kind: KindThinking, Text: data.Content})
 }
@@ -400,15 +462,41 @@ func handleCopilotInfo(raw json.RawMessage, fallback string, emit func(Event)) {
 	emit(Event{Kind: KindText, Text: data.Message})
 }
 
-func (state *copilotStreamState) emitMessage(
+func handleCopilotModelCallFailure(
 	raw json.RawMessage,
 	fallback string,
 	emit func(Event),
 ) {
-	var data copilotMessageData
+	var data copilotModelCallFailureData
 	if !decodeCopilotData(raw, &data, fallback, emit) {
 		return
 	}
+	emitCopilotRateLimits(data.QuotaSnapshots, emit)
+	text := data.ErrorMessage
+	if text == "" {
+		text = "model call failed"
+	}
+	var details []string
+	for _, detail := range []string{
+		data.Model,
+		data.FailureKind,
+		data.ErrorType,
+		data.ErrorCode,
+	} {
+		if detail != "" {
+			details = append(details, detail)
+		}
+	}
+	if data.StatusCode != nil {
+		details = append(details, "status "+strconv.Itoa(*data.StatusCode))
+	}
+	if len(details) > 0 {
+		text += " (" + strings.Join(details, ", ") + ")"
+	}
+	emit(Event{Kind: KindError, Text: text})
+}
+
+func (state *copilotStreamState) emitMessage(data copilotMessageData, emit func(Event)) {
 	if data.ReasoningText != "" {
 		emit(Event{Kind: KindThinking, Text: data.ReasoningText})
 	}
@@ -442,18 +530,72 @@ func (state *copilotStreamState) recordResultMessage(data copilotMessageData) {
 	state.result.Text = strings.Join(state.resultChunks, "")
 }
 
+func (state *copilotStreamState) recordMessageOutput(data copilotMessageData) {
+	if data.OutputTokens == nil || *data.OutputTokens < 0 {
+		return
+	}
+	key := data.APICallID
+	if key == "" {
+		key = data.MessageID
+	}
+	if key == "" {
+		state.unkeyedOutputTokens += *data.OutputTokens
+		return
+	}
+	if state.messageOutputTokens == nil {
+		state.messageOutputTokens = make(map[string]int)
+	}
+	if *data.OutputTokens > state.messageOutputTokens[key] {
+		state.messageOutputTokens[key] = *data.OutputTokens
+	}
+}
+
+func (state *copilotStreamState) unreportedMessageOutputTokenTotal() int {
+	if state.sawUnkeyedUsageOutput {
+		return 0
+	}
+	total := state.unkeyedOutputTokens
+	for apiCallID, tokens := range state.messageOutputTokens {
+		if _, reported := state.usageOutputAPICalls[apiCallID]; !reported {
+			total += tokens
+		}
+	}
+	return total
+}
+
 func (state *copilotStreamState) addUsage(data copilotUsageData) {
 	usage := Usage{
-		InputTokens:      data.InputTokens,
-		OutputTokens:     data.OutputTokens,
-		CacheReadTokens:  data.CacheReadTokens,
-		CacheWriteTokens: data.CacheWriteTokens,
+		InputTokens:      copilotTokenCount(data.InputTokens),
+		OutputTokens:     copilotTokenCount(data.OutputTokens),
+		CacheReadTokens:  copilotTokenCount(data.CacheReadTokens),
+		CacheWriteTokens: copilotTokenCount(data.CacheWriteTokens),
+	}
+	if data.OutputTokens != nil && *data.OutputTokens >= 0 {
+		if data.APICallID == "" {
+			state.sawUnkeyedUsageOutput = true
+		} else {
+			if state.usageOutputAPICalls == nil {
+				state.usageOutputAPICalls = make(map[string]struct{})
+			}
+			state.usageOutputAPICalls[data.APICallID] = struct{}{}
+		}
 	}
 	state.estimatedCostUSD += CostFromUsage(data.Model, usage)
+	if data.CopilotUsage != nil && data.CopilotUsage.TotalNanoAIU >= 0 {
+		state.billedCostUSD += copilotCheckpointCostUSD(data.CopilotUsage.TotalNanoAIU)
+		state.sawBilledUsage = true
+	}
 	state.result.Usage.InputTokens += usage.InputTokens
 	state.result.Usage.OutputTokens += usage.OutputTokens
 	state.result.Usage.CacheReadTokens += usage.CacheReadTokens
 	state.result.Usage.CacheWriteTokens += usage.CacheWriteTokens
+}
+
+func copilotTokenCount(value *int) int {
+	if value == nil || *value < 0 {
+		return 0
+	}
+	return *value
 }
 
 const (

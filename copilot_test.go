@@ -35,7 +35,7 @@ func TestCopilotArgs(t *testing.T) {
 		"claude-sonnet-4.6",
 		"--effort",
 		"high",
-		"--available-tools=view,create,edit,grep,glob,skill,task_complete",
+		"--available-tools=view,create,edit,grep,glob,skill",
 		"--resume=session-1",
 	} {
 		if !slices.Contains(args, want) {
@@ -75,14 +75,14 @@ func TestCopilotArgsDefaultsAndToolNormalization(t *testing.T) {
 				SkillName:    "recon",
 				AllowedTools: "Read,Write,Grep,Glob",
 			},
-			want: "view,create,edit,grep,glob,skill,task_complete",
+			want: "view,create,edit,grep,glob,skill",
 		},
 		{
 			name: "shell web and agents",
 			job: Job{
 				AllowedTools: "Bash,WebFetch,WebSearch,Task",
 			},
-			want: "bash,read_bash,stop_bash,list_bash,web_fetch,web_search,task,read_agent,list_agents,write_agent,task_complete",
+			want: "bash,read_bash,stop_bash,list_bash,web_fetch,web_search,task,read_agent,list_agents,write_agent",
 		},
 		{
 			name: "native names and duplicates",
@@ -90,7 +90,7 @@ func TestCopilotArgsDefaultsAndToolNormalization(t *testing.T) {
 				SkillName:    "audit",
 				AllowedTools: " view, Skill, ,grep,edit ",
 			},
-			want: "view,skill,grep,edit,task_complete",
+			want: "view,skill,grep,edit",
 		},
 	}
 	for _, test := range tests {
@@ -131,7 +131,9 @@ func TestCopilotStreamFixture(t *testing.T) {
 	if events[1].Text != "go test ./..." {
 		t.Errorf("tool summary = %q", events[1].Text)
 	}
-	if events[4].Turns != 1 || events[4].Usage.CacheReadTokens != 80 {
+	if events[4].Turns != 1 ||
+		events[4].Usage.OutputTokens != 4 ||
+		events[4].Usage.CacheReadTokens != 80 {
 		t.Errorf("result event = %+v", events[4])
 	}
 	if events[4].Text != "Done." {
@@ -207,6 +209,26 @@ func TestCopilotStreamReassemblesMessageChunks(t *testing.T) {
 	}
 }
 
+func TestCopilotStreamDeduplicatesMessageReasoning(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.message","id":"message-event","data":{"apiCallId":"call-1","reasoningText":"checking","content":"done"}}`,
+		`{"type":"assistant.reasoning","parentId":"message-event","data":{"reasoningId":"reasoning-1","content":"checking"}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var thinking []string
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		if event.Kind == KindThinking {
+			thinking = append(thinking, event.Text)
+		}
+	})
+	if !slices.Equal(thinking, []string{"checking"}) {
+		t.Errorf("thinking events = %q, want one copy", thinking)
+	}
+}
+
 func TestCopilotStreamUsesLatestUsageCheckpointCost(t *testing.T) {
 	t.Parallel()
 
@@ -228,6 +250,37 @@ func TestCopilotStreamUsesLatestUsageCheckpointCost(t *testing.T) {
 	}
 	result := events[1]
 	const wantCostUSD = 0.08148135
+	if math.Abs(result.CostUSD-wantCostUSD) > 1e-12 {
+		t.Errorf("cost = %.12f, want %.12f", result.CostUSD, wantCostUSD)
+	}
+}
+
+func TestCopilotStreamUsesPerCallBillingAndMessageOutput(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.message","data":{"apiCallId":"root-call","messageId":"root-1","chunkIndex":0,"chunkCount":2,"content":"first ","outputTokens":20}}`,
+		`{"type":"assistant.message","data":{"apiCallId":"root-call","messageId":"root-2","chunkIndex":1,"chunkCount":2,"content":"last","outputTokens":30}}`,
+		`{"type":"assistant.message","agentId":"child-1","data":{"apiCallId":"child-call","messageId":"child-1","content":"nested","outputTokens":10}}`,
+		`{"type":"assistant.usage","data":{"apiCallId":"root-call","model":"claude-sonnet-4.6","outputTokens":30,"copilotUsage":{"totalNanoAiu":1000000000}}}`,
+		`{"type":"assistant.usage","agentId":"child-1","data":{"apiCallId":"child-call","model":"claude-sonnet-4.6","copilotUsage":{"totalNanoAiu":2000000000}}}`,
+		`{"type":"session.usage_checkpoint","data":{"totalNanoAiu":100000000000}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var result Event
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		if event.Kind == KindResult {
+			result = event
+		}
+	})
+	if result.Text != "first last" {
+		t.Errorf("result text = %q", result.Text)
+	}
+	if result.Usage.OutputTokens != 40 {
+		t.Errorf("output tokens = %d, want 40", result.Usage.OutputTokens)
+	}
+	const wantCostUSD = 0.03
 	if math.Abs(result.CostUSD-wantCostUSD) > 1e-12 {
 		t.Errorf("cost = %.12f, want %.12f", result.CostUSD, wantCostUSD)
 	}
@@ -361,10 +414,37 @@ func TestCopilotStreamAllowsNonOverageFallback(t *testing.T) {
 	}
 }
 
+func TestCopilotStreamModelCallFailure(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"model.call_failure","data":{"model":"claude-sonnet-4.6","failureKind":"api","errorCode":"quota_exceeded","errorMessage":"Additional usage limit reached.","statusCode":402,"quotaSnapshots":{"premium_interactions":{"hasQuota":false,"overageAllowedWithExhaustedQuota":false,"usageAllowedWithExhaustedQuota":false}}}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":1}`,
+	}, "\n")
+
+	var events []Event
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		events = append(events, event)
+	})
+	if len(events) != 4 {
+		t.Fatalf("events = %+v", events)
+	}
+	if events[0].Kind != KindRateLimit || !events[0].RateLimit.Rejected() {
+		t.Errorf("rate limit = %+v", events[0])
+	}
+	if events[1].Kind != KindError ||
+		!strings.Contains(events[1].Text, "quota_exceeded") ||
+		!strings.Contains(events[1].Text, "status 402") {
+		t.Errorf("model failure = %+v", events[1])
+	}
+}
+
 func TestCopilotStreamSurfacesMalformedAndUnknownEvents(t *testing.T) {
 	t.Parallel()
 
 	stream := strings.Join([]string{
+		`{"type":"mcp.tools.list_changed","data":{"serverName":"github-mcp-server"}}`,
+		`{"type":"session.task_complete","data":{"summary":"done","success":true}}`,
 		`{"type":"assistant.reasoning","data":"invalid"}`,
 		`{"type":"future.event","data":{"value":1}}`,
 		`not-json`,

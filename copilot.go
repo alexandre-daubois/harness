@@ -95,6 +95,11 @@ func copilotAvailableTools(j Job) string {
 	if j.SkillName != "" {
 		appendTool("skill")
 	}
+	// Copilot 1.0.80 reports task_complete as an unknown allowlist name, but
+	// omitting it makes restricted autopilot runs fail because the mode still
+	// requires that control tool. Preserve the working behavior until the CLI
+	// treats its built-in control consistently.
+	appendTool("task_complete")
 	return strings.Join(tools, ",")
 }
 

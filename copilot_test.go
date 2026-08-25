@@ -35,7 +35,7 @@ func TestCopilotArgs(t *testing.T) {
 		"claude-sonnet-4.6",
 		"--effort",
 		"high",
-		"--available-tools=view,create,edit,grep,glob,skill",
+		"--available-tools=view,create,edit,grep,glob,skill,task_complete",
 		"--resume=session-1",
 	} {
 		if !slices.Contains(args, want) {
@@ -75,14 +75,14 @@ func TestCopilotArgsDefaultsAndToolNormalization(t *testing.T) {
 				SkillName:    "recon",
 				AllowedTools: "Read,Write,Grep,Glob",
 			},
-			want: "view,create,edit,grep,glob,skill",
+			want: "view,create,edit,grep,glob,skill,task_complete",
 		},
 		{
 			name: "shell web and agents",
 			job: Job{
 				AllowedTools: "Bash,WebFetch,WebSearch,Task",
 			},
-			want: "bash,read_bash,stop_bash,list_bash,web_fetch,web_search,task,read_agent,list_agents,write_agent",
+			want: "bash,read_bash,stop_bash,list_bash,web_fetch,web_search,task,read_agent,list_agents,write_agent,task_complete",
 		},
 		{
 			name: "native names and duplicates",
@@ -90,7 +90,7 @@ func TestCopilotArgsDefaultsAndToolNormalization(t *testing.T) {
 				SkillName:    "audit",
 				AllowedTools: " view, Skill, ,grep,edit ",
 			},
-			want: "view,skill,grep,edit",
+			want: "view,skill,grep,edit,task_complete",
 		},
 	}
 	for _, test := range tests {

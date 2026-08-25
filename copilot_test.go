@@ -185,6 +185,28 @@ func TestCopilotStreamAccumulatesOneTerminalResult(t *testing.T) {
 	}
 }
 
+func TestCopilotStreamReassemblesMessageChunks(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.message","data":{"apiCallId":"old-call","content":"old response"}}`,
+		`{"type":"assistant.message","data":{"apiCallId":"final-call","chunkIndex":1,"chunkCount":3,"content":"middle "}}`,
+		`{"type":"assistant.message","data":{"apiCallId":"final-call","chunkIndex":0,"chunkCount":3,"content":"first "}}`,
+		`{"type":"assistant.message","data":{"apiCallId":"final-call","chunkIndex":2,"chunkCount":3,"content":"last"}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var result Event
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		if event.Kind == KindResult {
+			result = event
+		}
+	})
+	if result.Text != "first middle last" {
+		t.Errorf("result text = %q, want reassembled final model call", result.Text)
+	}
+}
+
 func TestCopilotStreamUsesLatestUsageCheckpointCost(t *testing.T) {
 	t.Parallel()
 
@@ -311,6 +333,31 @@ func TestCopilotStreamQuotaAndErrors(t *testing.T) {
 		if event.Kind == KindSession {
 			t.Errorf("failed run emitted resumable session: %+v", event)
 		}
+	}
+}
+
+func TestCopilotStreamAllowsNonOverageFallback(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.usage","data":{"model":"claude-sonnet-4.6","quotaSnapshots":{"chat":{"hasQuota":false,"overage":1,"overageAllowedWithExhaustedQuota":false,"usageAllowedWithExhaustedQuota":true}}}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var limit *RateLimitInfo
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		if event.Kind == KindRateLimit {
+			limit = event.RateLimit
+		}
+	})
+	if limit == nil {
+		t.Fatal("missing rate-limit event")
+	}
+	if limit.IsUsingOverage {
+		t.Errorf("IsUsingOverage = true when overage is not allowed: %+v", limit)
+	}
+	if limit.Rejected() {
+		t.Errorf("Rejected() = true when exhausted-quota fallback is allowed: %+v", limit)
 	}
 }
 

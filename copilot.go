@@ -133,6 +133,8 @@ type copilotLine struct {
 
 type copilotStreamState struct {
 	result             Event
+	resultAPICallID    string
+	resultChunks       []string
 	estimatedCostUSD   float64
 	checkpointCostUSD  float64
 	sawUsageCheckpoint bool
@@ -140,6 +142,9 @@ type copilotStreamState struct {
 }
 
 type copilotMessageData struct {
+	APICallID     string `json:"apiCallId"`
+	ChunkCount    *int   `json:"chunkCount"`
+	ChunkIndex    *int   `json:"chunkIndex"`
 	Content       string `json:"content"`
 	ReasoningText string `json:"reasoningText"`
 }
@@ -409,8 +414,32 @@ func (state *copilotStreamState) emitMessage(
 	}
 	if data.Content != "" {
 		emit(Event{Kind: KindText, Text: data.Content})
-		state.result.Text = data.Content
+		state.recordResultMessage(data)
 	}
+}
+
+func (state *copilotStreamState) recordResultMessage(data copilotMessageData) {
+	// A model call can emit several complete message records around reasoning
+	// boundaries. Reassemble those records, but replace the result when a later
+	// API call starts so Text remains the final response rather than a transcript.
+	if data.APICallID == "" ||
+		data.ChunkCount == nil ||
+		data.ChunkIndex == nil ||
+		*data.ChunkCount <= 1 ||
+		*data.ChunkIndex < 0 ||
+		*data.ChunkIndex >= *data.ChunkCount {
+		state.resultAPICallID = data.APICallID
+		state.resultChunks = nil
+		state.result.Text = data.Content
+		return
+	}
+	if state.resultAPICallID != data.APICallID ||
+		len(state.resultChunks) != *data.ChunkCount {
+		state.resultAPICallID = data.APICallID
+		state.resultChunks = make([]string, *data.ChunkCount)
+	}
+	state.resultChunks[*data.ChunkIndex] = data.Content
+	state.result.Text = strings.Join(state.resultChunks, "")
 }
 
 func (state *copilotStreamState) addUsage(data copilotUsageData) {
@@ -464,10 +493,12 @@ func emitCopilotRateLimits(snapshots map[string]copilotQuotaSnapshot, emit func(
 		if snapshot.OverageAllowedWithExhaustedQuota {
 			overageStatus = "allowed"
 		}
+		usingOverage := snapshot.Overage > 0 &&
+			snapshot.OverageAllowedWithExhaustedQuota
 		info := &RateLimitInfo{
 			Status:         status,
 			OverageStatus:  overageStatus,
-			IsUsingOverage: snapshot.Overage > 0,
+			IsUsingOverage: usingOverage,
 			Type:           key,
 		}
 		if reset, err := time.Parse(time.RFC3339, snapshot.ResetDate); err == nil {

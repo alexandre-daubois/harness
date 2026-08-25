@@ -202,11 +202,15 @@ type copilotUsageCheckpointData struct {
 }
 
 type copilotQuotaSnapshot struct {
-	HasQuota                         *bool   `json:"hasQuota"`
-	Overage                          float64 `json:"overage"`
-	OverageAllowedWithExhaustedQuota bool    `json:"overageAllowedWithExhaustedQuota"`
-	ResetDate                        string  `json:"resetDate"`
-	UsageAllowedWithExhaustedQuota   bool    `json:"usageAllowedWithExhaustedQuota"`
+	HasQuota                         *bool    `json:"hasQuota"`
+	EntitlementRequests              *float64 `json:"entitlementRequests"`
+	IsUnlimitedEntitlement           bool     `json:"isUnlimitedEntitlement"`
+	Overage                          float64  `json:"overage"`
+	OverageAllowedWithExhaustedQuota bool     `json:"overageAllowedWithExhaustedQuota"`
+	RemainingPercentage              *float64 `json:"remainingPercentage"`
+	ResetDate                        string   `json:"resetDate"`
+	UsageAllowedWithExhaustedQuota   bool     `json:"usageAllowedWithExhaustedQuota"`
+	UsedRequests                     *float64 `json:"usedRequests"`
 }
 
 type copilotErrorData struct {
@@ -619,7 +623,16 @@ func decodeCopilotData(raw json.RawMessage, target any, fallback string, emit fu
 func emitCopilotRateLimits(snapshots map[string]copilotQuotaSnapshot, emit func(Event)) {
 	keys := make([]string, 0, len(snapshots))
 	for key, snapshot := range snapshots {
-		if snapshot.HasQuota != nil && !*snapshot.HasQuota {
+		exhausted := snapshot.HasQuota != nil && !*snapshot.HasQuota
+		if snapshot.HasQuota == nil && !snapshot.IsUnlimitedEntitlement {
+			exhausted = snapshot.RemainingPercentage != nil &&
+				*snapshot.RemainingPercentage <= 0
+			if snapshot.EntitlementRequests != nil && snapshot.UsedRequests != nil {
+				exhausted = exhausted ||
+					*snapshot.UsedRequests >= *snapshot.EntitlementRequests
+			}
+		}
+		if exhausted {
 			keys = append(keys, key)
 		}
 	}

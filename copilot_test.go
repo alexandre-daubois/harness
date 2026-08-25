@@ -414,6 +414,26 @@ func TestCopilotStreamAllowsNonOverageFallback(t *testing.T) {
 	}
 }
 
+func TestCopilotStreamInfersExhaustedQuotaWithoutHasQuota(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.usage","data":{"model":"claude-sonnet-4.6","quotaSnapshots":{"chat":{"isUnlimitedEntitlement":true,"entitlementRequests":0,"usedRequests":0,"remainingPercentage":100},"premium_interactions":{"isUnlimitedEntitlement":false,"entitlementRequests":300,"usedRequests":300,"remainingPercentage":0,"resetDate":"2026-08-27T12:00:00Z"}}}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var limits []*RateLimitInfo
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		if event.Kind == KindRateLimit {
+			limits = append(limits, event.RateLimit)
+		}
+	})
+	if len(limits) != 1 || limits[0].Type != "premium_interactions" ||
+		!limits[0].Rejected() {
+		t.Errorf("rate limits = %+v", limits)
+	}
+}
+
 func TestCopilotStreamModelCallFailure(t *testing.T) {
 	t.Parallel()
 

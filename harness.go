@@ -35,7 +35,9 @@ type Job struct {
 	// other backends.
 	SystemPrompt string
 
-	Model    string
+	Model string
+	// Effort is the backend-native reasoning effort accepted by Claude and
+	// Copilot. An empty value leaves the backend default unchanged.
 	Effort   string
 	MaxTurns int
 
@@ -50,8 +52,9 @@ type Job struct {
 	// to check against ./schema.json is used.
 	ValidationHint string
 
-	// AllowedTools is Claude's comma-separated tool allowlist. Other backends
-	// leave tool restrictions to their caller's sandbox.
+	// AllowedTools is a comma-separated backend-native tool allowlist. Claude
+	// and Copilot enforce it; other backends leave tool restrictions to their
+	// caller's sandbox.
 	AllowedTools string
 
 	// BaseURL overrides the model API endpoint where the backend supports it.

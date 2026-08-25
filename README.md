@@ -15,8 +15,13 @@ and event parser.
 | `copilot` | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | `.github/skills/<name>` | `.github/copilot-instructions.md` | `github.com`, `api.github.com`, `api.mcp.github.com`, `*.githubcopilot.com` |
 | `opencode` | `opencode` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_AUTH_CONTENT` | `.opencode/skill/<name>` | `AGENTS.md` | `models.dev`, `api.openai.com`, `*.anthropic.com` |
 
-The Copilot parser targets CLI 1.0.75 or later, where
-`--output-format json` emits JSONL in prompt mode.
+The Copilot adapter targets CLI 1.0.80 and remains compatible with the
+prompt-mode JSONL stream introduced in 1.0.75.
+
+For Copilot BYOK runs, `Job.BaseURL` sets `COPILOT_PROVIDER_BASE_URL`.
+`Harness.Env` also passes through configured provider credentials and wire
+settings as bare keys so container and remote runners can inject their values
+without placing secrets in argv.
 
 The library owns the details that differ between CLIs: binary names, arguments,
 credential and state environment variables, project instruction files, skill
@@ -65,9 +70,11 @@ is already the repository root. `SkillName` selects a staged `SKILL.md`; when
 uses `--system-prompt` with Claude and the backend's project instruction file
 for the other CLIs.
 
-`MaxTurns` uses the backend default when set to zero. `Effort` and
-`AllowedTools` currently apply only to Claude. `ResumeSessionID` and
-`ResumePrompt` continue an existing conversation.
+`MaxTurns` uses the backend default when set to zero; Copilot maps it to maximum
+autopilot continuations. `Effort` applies to Claude and Copilot.
+`AllowedTools` is a comma-separated list of backend-native tool names enforced
+by Claude and Copilot; callers must not reuse one backend's tool names for
+another. `ResumeSessionID` and `ResumePrompt` continue an existing conversation.
 
 The `Harness` interface exposes the parts needed by local, container, and remote
 runners:
@@ -115,7 +122,9 @@ type Event struct {
 Kinds are `thinking`, `text`, `tool`, `result`, `error`, `session`, and
 `rate_limit`. `FormatEvent` renders an event for a plain-text log.
 `CostFromUsage` calculates a list-price estimate when the CLI reports tokens
-without a dollar amount.
+without a dollar amount. Copilot 1.0.80 instead exposes cumulative nano-AIU
+billing checkpoints; the parser uses the latest checkpoint and converts AI
+credits to `CostUSD`.
 
 ## Run a local subprocess
 
@@ -223,10 +232,12 @@ arguments, so the helper does not write a guide file.
 
 The generated arguments allow unattended tool use. Claude uses
 `bypassPermissions` unless `AllowedTools` is set. Codex uses
-`danger-full-access`, OpenCode uses `--auto`, and Copilot uses `--allow-all`.
-Run these commands only in a workspace and execution environment where those
-permissions are acceptable. Container and remote callers should apply their
-own filesystem, process, secret, and network limits.
+`danger-full-access`, OpenCode uses `--auto`, and Copilot uses `--allow-all`;
+Copilot's `AllowedTools` filter limits which tools the model sees but does not
+narrow path or URL permissions for those tools. Run these commands only in a
+workspace and execution environment where those permissions are acceptable.
+Container and remote callers should apply their own filesystem, process,
+secret, and network limits.
 
 The `egress` package can restrict outbound HTTP and HTTPS by hostname. Its proxy
 checks the resolved destination immediately before connecting and rejects

@@ -5,19 +5,22 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // CopilotHarness drives GitHub Copilot CLI in non-interactive prompt mode.
-// Its arguments and JSONL mapping are based on Copilot CLI 1.0.75.
+// Its arguments and JSONL mapping target Copilot CLI 1.0.80 while retaining
+// compatibility with the prompt-mode stream introduced in 1.0.75.
 type CopilotHarness struct{}
 
 func (CopilotHarness) Binary() string { return "copilot" }
 
 // Args enables autopilot and tool use without interactive confirmation. The
-// caller must isolate the process and workspace because --allow-all grants the
-// CLI every tool it exposes.
+// caller must isolate the process and workspace because --allow-all approves
+// every tool exposed after any AllowedTools filter is applied.
 func (CopilotHarness) Args(j Job) []string {
 	maxTurns := j.MaxTurns
 	if maxTurns <= 0 {
@@ -32,9 +35,16 @@ func (CopilotHarness) Args(j Job) []string {
 		"--no-ask-user",
 		"--no-auto-update",
 		"--no-color",
+		"--no-remote-export",
 	}
 	if j.Model != "" {
 		args = append(args, "--model", j.Model)
+	}
+	if j.Effort != "" {
+		args = append(args, "--effort", j.Effort)
+	}
+	if tools := copilotAvailableTools(j); tools != "" {
+		args = append(args, "--available-tools="+tools)
 	}
 	if id := safeSessionID(j.ResumeSessionID); id != "" {
 		args = append(args, "--resume="+id)
@@ -42,35 +52,46 @@ func (CopilotHarness) Args(j Job) []string {
 	return args
 }
 
+func copilotAvailableTools(j Job) string {
+	if strings.TrimSpace(j.AllowedTools) == "" {
+		return ""
+	}
+	raw := strings.Split(j.AllowedTools, ",")
+	tools := make([]string, 0, len(raw)+1)
+	hasSkill := false
+	for _, name := range raw {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		tools = append(tools, name)
+		hasSkill = hasSkill || strings.EqualFold(name, "skill")
+	}
+	if j.SkillName != "" && !hasSkill {
+		tools = append(tools, "skill")
+	}
+	return strings.Join(tools, ",")
+}
+
 func (CopilotHarness) Prompt(j Job) string {
 	return explicitSkillPrompt(j, "./.github/skills/"+j.SkillName)
 }
 
-// ParseStream combines per-call assistant.usage and per-turn
-// assistant.turn_end records into one result emitted after the stream ends.
-// This gives callers the same single-run totals exposed by the other backends
-// and prevents consumers that retain only the last result from losing usage.
+// ParseStream combines per-call token usage, cumulative billing checkpoints,
+// and root-agent turns into one result emitted after Copilot's final envelope.
+// Sub-agent calls remain part of the usage total, but their nested conversation
+// events stay out of the parent stream.
 func (CopilotHarness) ParseStream(r io.Reader, emit func(Event)) {
-	total := Event{Kind: KindResult}
-	sawResult := false
-	scanJSONL(r, func(event Event) {
-		if event.Kind != KindResult {
-			emit(event)
-			return
+	state := copilotStreamState{
+		result: Event{Kind: KindResult},
+	}
+	scanJSONL(r, emit, state.parseLine)
+	if state.sawTerminal {
+		state.result.CostUSD = state.estimatedCostUSD
+		if state.sawUsageCheckpoint {
+			state.result.CostUSD = state.checkpointCostUSD
 		}
-		sawResult = true
-		total.CostUSD += event.CostUSD
-		total.Turns += event.Turns
-		total.Usage.InputTokens += event.Usage.InputTokens
-		total.Usage.OutputTokens += event.Usage.OutputTokens
-		total.Usage.CacheReadTokens += event.Usage.CacheReadTokens
-		total.Usage.CacheWriteTokens += event.Usage.CacheWriteTokens
-		if event.Text != "" {
-			total.Text = event.Text
-		}
-	}, parseCopilotLine)
-	if sawResult {
-		emit(total)
+		emit(state.result)
 	}
 }
 
@@ -79,8 +100,17 @@ func (CopilotHarness) ParseStream(r io.Reader, emit func(Event)) {
 type copilotLine struct {
 	Type      string          `json:"type"`
 	Data      json.RawMessage `json:"data"`
+	AgentID   string          `json:"agentId"`
 	SessionID string          `json:"sessionId"`
 	ExitCode  *int            `json:"exitCode"`
+}
+
+type copilotStreamState struct {
+	result             Event
+	estimatedCostUSD   float64
+	checkpointCostUSD  float64
+	sawUsageCheckpoint bool
+	sawTerminal        bool
 }
 
 type copilotMessageData struct {
@@ -92,25 +122,57 @@ type copilotReasoningData struct {
 	Content string `json:"content"`
 }
 
+type copilotIntentData struct {
+	Intent string `json:"intent"`
+}
+
 type copilotToolData struct {
 	ToolName  string          `json:"toolName"`
 	Arguments json.RawMessage `json:"arguments"`
 }
 
+type copilotTurnData struct {
+	TurnID string `json:"turnId"`
+}
+
 type copilotUsageData struct {
-	Model            string `json:"model"`
-	InputTokens      int    `json:"inputTokens"`
-	OutputTokens     int    `json:"outputTokens"`
-	CacheReadTokens  int    `json:"cacheReadTokens"`
-	CacheWriteTokens int    `json:"cacheWriteTokens"`
+	Model            string                          `json:"model"`
+	InputTokens      int                             `json:"inputTokens"`
+	OutputTokens     int                             `json:"outputTokens"`
+	CacheReadTokens  int                             `json:"cacheReadTokens"`
+	CacheWriteTokens int                             `json:"cacheWriteTokens"`
+	QuotaSnapshots   map[string]copilotQuotaSnapshot `json:"quotaSnapshots"`
+}
+
+type copilotUsageCheckpointData struct {
+	TotalNanoAIU *float64 `json:"totalNanoAiu"`
+}
+
+type copilotQuotaSnapshot struct {
+	HasQuota                         *bool   `json:"hasQuota"`
+	Overage                          float64 `json:"overage"`
+	OverageAllowedWithExhaustedQuota bool    `json:"overageAllowedWithExhaustedQuota"`
+	ResetDate                        string  `json:"resetDate"`
+	UsageAllowedWithExhaustedQuota   bool    `json:"usageAllowedWithExhaustedQuota"`
 }
 
 type copilotErrorData struct {
-	Message string `json:"message"`
-	Error   string `json:"error"`
+	Message    string          `json:"message"`
+	Error      json.RawMessage `json:"error"`
+	ErrorType  string          `json:"errorType"`
+	ErrorCode  string          `json:"errorCode"`
+	StatusCode *int            `json:"statusCode"`
 }
 
-func parseCopilotLine(raw []byte, emit func(Event)) {
+type copilotAbortData struct {
+	Reason string `json:"reason"`
+}
+
+type copilotInfoData struct {
+	Message string `json:"message"`
+}
+
+func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
 	line := strings.TrimSpace(string(raw))
 	if line == "" {
 		return
@@ -122,75 +184,198 @@ func parseCopilotLine(raw []byte, emit func(Event)) {
 	}
 	switch event.Type {
 	case "assistant.message":
-		emitCopilotMessage(event.Data, emit)
+		state.handleMessage(&event, line, emit)
 	case "assistant.reasoning":
-		var data copilotReasoningData
-		if json.Unmarshal(event.Data, &data) == nil && data.Content != "" {
-			emit(Event{Kind: KindThinking, Text: data.Content})
-		}
+		handleCopilotReasoning(&event, line, emit)
+	case "assistant.intent":
+		handleCopilotIntent(&event, line, emit)
 	case "tool.execution_start":
-		var data copilotToolData
-		if json.Unmarshal(event.Data, &data) == nil {
-			emit(Event{
-				Kind: KindTool,
-				Tool: data.ToolName,
-				Text: summariseInput(data.ToolName, data.Arguments),
-			})
-		}
+		handleCopilotTool(&event, line, emit)
 	case "assistant.usage":
-		var data copilotUsageData
-		if json.Unmarshal(event.Data, &data) == nil {
-			usage := Usage{
-				InputTokens:      data.InputTokens,
-				OutputTokens:     data.OutputTokens,
-				CacheReadTokens:  data.CacheReadTokens,
-				CacheWriteTokens: data.CacheWriteTokens,
-			}
-			emit(Event{
-				Kind:    KindResult,
-				CostUSD: CostFromUsage(data.Model, usage),
-				Usage:   usage,
-			})
-		}
+		state.handleUsage(event.Data, line, emit)
+	case "session.usage_checkpoint":
+		state.handleUsageCheckpoint(event.Data, line, emit)
 	case "assistant.turn_end":
-		// Copilot reports turns separately from token usage. ParseStream merges
-		// both records into one result after all turns finish.
-		emit(Event{Kind: KindResult, Turns: 1})
+		state.handleTurnEnd(&event, line, emit)
 	case "result":
-		if event.SessionID != "" {
-			emit(Event{Kind: KindSession, SessionID: event.SessionID})
-		}
-		if event.ExitCode != nil && *event.ExitCode != 0 {
-			emit(Event{Kind: KindError, Text: fmt.Sprintf("copilot exited with code %d", *event.ExitCode)})
-		}
-		// The final envelope guarantees a terminal result even if a failed or
-		// empty run produced no usage and no completed turn.
-		emit(Event{Kind: KindResult})
-	case "abort", "session.error", "error":
+		state.handleResult(&event, emit)
+	case "session.error", "error":
 		emitCopilotError(event.Data, line, emit)
+	case "abort":
+		emitCopilotAbort(event.Data, line, emit)
+	case "session.info":
+		handleCopilotInfo(event.Data, line, emit)
 	case "assistant.message_delta",
 		"assistant.message_start",
 		"assistant.reasoning_delta",
+		"assistant.streaming_delta",
 		"assistant.tool_call_delta",
 		"assistant.turn_start",
 		"assistant.idle",
 		"model.call_start",
 		"model.call_end",
+		"session.idle",
 		"session.mcp_server_status_changed",
 		"session.mcp_servers_loaded",
 		"session.skills_loaded",
 		"session.tools_updated",
-		"session.usage_checkpoint",
 		"session.usage_info",
+		"tool.execution_complete",
+		"tool.execution_partial_result",
+		"tool.execution_progress",
 		"user.message":
 	default:
 		emit(Event{Kind: KindText, Text: line})
 	}
 }
 
-func emitCopilotMessage(raw json.RawMessage, emit func(Event)) {
+func (state *copilotStreamState) handleMessage(
+	event *copilotLine,
+	fallback string,
+	emit func(Event),
+) {
+	if event.AgentID == "" {
+		state.emitMessage(event.Data, fallback, emit)
+	}
+}
+
+func handleCopilotReasoning(event *copilotLine, fallback string, emit func(Event)) {
+	if event.AgentID != "" {
+		return
+	}
+	var data copilotReasoningData
+	if !decodeCopilotData(event.Data, &data, fallback, emit) {
+		return
+	}
+	if data.Content == "" {
+		emit(Event{Kind: KindText, Text: fallback})
+		return
+	}
+	emit(Event{Kind: KindThinking, Text: data.Content})
+}
+
+func handleCopilotIntent(event *copilotLine, fallback string, emit func(Event)) {
+	if event.AgentID != "" {
+		return
+	}
+	var data copilotIntentData
+	if !decodeCopilotData(event.Data, &data, fallback, emit) {
+		return
+	}
+	if data.Intent == "" {
+		emit(Event{Kind: KindText, Text: fallback})
+		return
+	}
+	emit(Event{Kind: KindThinking, Text: data.Intent})
+}
+
+func handleCopilotTool(event *copilotLine, fallback string, emit func(Event)) {
+	if event.AgentID != "" {
+		return
+	}
+	var data copilotToolData
+	if !decodeCopilotData(event.Data, &data, fallback, emit) {
+		return
+	}
+	if data.ToolName == "" {
+		emit(Event{Kind: KindText, Text: fallback})
+		return
+	}
+	emit(Event{
+		Kind: KindTool,
+		Tool: data.ToolName,
+		Text: summariseInput(data.ToolName, data.Arguments),
+	})
+}
+
+func (state *copilotStreamState) handleUsage(
+	raw json.RawMessage,
+	fallback string,
+	emit func(Event),
+) {
+	var data copilotUsageData
+	if !decodeCopilotData(raw, &data, fallback, emit) {
+		return
+	}
+	if data.Model == "" {
+		emit(Event{Kind: KindText, Text: fallback})
+		return
+	}
+	state.addUsage(data)
+	emitCopilotRateLimits(data.QuotaSnapshots, emit)
+}
+
+func (state *copilotStreamState) handleUsageCheckpoint(
+	raw json.RawMessage,
+	fallback string,
+	emit func(Event),
+) {
+	var data copilotUsageCheckpointData
+	if !decodeCopilotData(raw, &data, fallback, emit) {
+		return
+	}
+	if data.TotalNanoAIU == nil || *data.TotalNanoAIU < 0 {
+		emit(Event{Kind: KindText, Text: fallback})
+		return
+	}
+	// Checkpoints are cumulative, so the latest value replaces earlier values
+	// and any token-based estimate rather than being added to them.
+	state.checkpointCostUSD = copilotCheckpointCostUSD(*data.TotalNanoAIU)
+	state.sawUsageCheckpoint = true
+}
+
+func (state *copilotStreamState) handleTurnEnd(
+	event *copilotLine,
+	fallback string,
+	emit func(Event),
+) {
+	if event.AgentID != "" {
+		return
+	}
+	var data copilotTurnData
+	if !decodeCopilotData(event.Data, &data, fallback, emit) {
+		return
+	}
+	if data.TurnID == "" {
+		emit(Event{Kind: KindText, Text: fallback})
+		return
+	}
+	state.result.Turns++
+}
+
+func (state *copilotStreamState) handleResult(event *copilotLine, emit func(Event)) {
+	if state.sawTerminal {
+		return
+	}
+	state.sawTerminal = true
+	failed := event.ExitCode != nil && *event.ExitCode != 0
+	if event.SessionID != "" && !failed {
+		emit(Event{Kind: KindSession, SessionID: event.SessionID})
+	}
+	if failed {
+		emit(Event{Kind: KindError, Text: fmt.Sprintf("copilot exited with code %d", *event.ExitCode)})
+	}
+}
+
+func handleCopilotInfo(raw json.RawMessage, fallback string, emit func(Event)) {
+	var data copilotInfoData
+	if !decodeCopilotData(raw, &data, fallback, emit) {
+		return
+	}
+	if data.Message == "" {
+		emit(Event{Kind: KindText, Text: fallback})
+		return
+	}
+	emit(Event{Kind: KindText, Text: data.Message})
+}
+
+func (state *copilotStreamState) emitMessage(
+	raw json.RawMessage,
+	fallback string,
+	emit func(Event),
+) {
 	var data copilotMessageData
-	if json.Unmarshal(raw, &data) != nil {
+	if !decodeCopilotData(raw, &data, fallback, emit) {
 		return
 	}
 	if data.ReasoningText != "" {
@@ -198,20 +383,124 @@ func emitCopilotMessage(raw json.RawMessage, emit func(Event)) {
 	}
 	if data.Content != "" {
 		emit(Event{Kind: KindText, Text: data.Content})
+		state.result.Text = data.Content
+	}
+}
+
+func (state *copilotStreamState) addUsage(data copilotUsageData) {
+	usage := Usage{
+		InputTokens:      data.InputTokens,
+		OutputTokens:     data.OutputTokens,
+		CacheReadTokens:  data.CacheReadTokens,
+		CacheWriteTokens: data.CacheWriteTokens,
+	}
+	state.estimatedCostUSD += CostFromUsage(data.Model, usage)
+	state.result.Usage.InputTokens += usage.InputTokens
+	state.result.Usage.OutputTokens += usage.OutputTokens
+	state.result.Usage.CacheReadTokens += usage.CacheReadTokens
+	state.result.Usage.CacheWriteTokens += usage.CacheWriteTokens
+}
+
+const (
+	nanoAIUPerAICredit = 1e9
+	usdPerAICredit     = 0.01
+)
+
+func copilotCheckpointCostUSD(totalNanoAIU float64) float64 {
+	// Copilot bills one AI credit as $0.01; nano-AIU uses the SI nano scale.
+	return totalNanoAIU / nanoAIUPerAICredit * usdPerAICredit
+}
+
+func decodeCopilotData(raw json.RawMessage, target any, fallback string, emit func(Event)) bool {
+	if len(raw) == 0 || json.Unmarshal(raw, target) != nil {
+		emit(Event{Kind: KindText, Text: fallback})
+		return false
+	}
+	return true
+}
+
+func emitCopilotRateLimits(snapshots map[string]copilotQuotaSnapshot, emit func(Event)) {
+	keys := make([]string, 0, len(snapshots))
+	for key, snapshot := range snapshots {
+		if snapshot.HasQuota != nil && !*snapshot.HasQuota {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		snapshot := snapshots[key]
+		status := "allowed"
+		if !snapshot.UsageAllowedWithExhaustedQuota &&
+			!snapshot.OverageAllowedWithExhaustedQuota {
+			status = "rejected"
+		}
+		overageStatus := "rejected"
+		if snapshot.OverageAllowedWithExhaustedQuota {
+			overageStatus = "allowed"
+		}
+		info := &RateLimitInfo{
+			Status:         status,
+			OverageStatus:  overageStatus,
+			IsUsingOverage: snapshot.Overage > 0,
+			Type:           key,
+		}
+		if reset, err := time.Parse(time.RFC3339, snapshot.ResetDate); err == nil {
+			info.ResetsAt = reset.Unix()
+		}
+		emit(Event{Kind: KindRateLimit, RateLimit: info})
 	}
 }
 
 func emitCopilotError(raw json.RawMessage, fallback string, emit func(Event)) {
 	var data copilotErrorData
 	if json.Unmarshal(raw, &data) == nil {
-		if data.Message != "" {
-			emit(Event{Kind: KindError, Text: data.Message})
+		text := data.Message
+		if text == "" {
+			text = copilotNestedErrorText(data.Error)
+		}
+		if text != "" {
+			var details []string
+			if data.ErrorType != "" {
+				details = append(details, data.ErrorType)
+			}
+			if data.ErrorCode != "" {
+				details = append(details, data.ErrorCode)
+			}
+			if data.StatusCode != nil {
+				details = append(details, "status "+strconv.Itoa(*data.StatusCode))
+			}
+			if len(details) > 0 {
+				text += " (" + strings.Join(details, ", ") + ")"
+			}
+			emit(Event{Kind: KindError, Text: text})
 			return
 		}
-		if data.Error != "" {
-			emit(Event{Kind: KindError, Text: data.Error})
-			return
-		}
+	}
+	emit(Event{Kind: KindError, Text: fallback})
+}
+
+func copilotNestedErrorText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var nested struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &nested) == nil {
+		return nested.Message
+	}
+	return ""
+}
+
+func emitCopilotAbort(raw json.RawMessage, fallback string, emit func(Event)) {
+	var data copilotAbortData
+	if json.Unmarshal(raw, &data) == nil && data.Reason != "" {
+		emit(Event{Kind: KindError, Text: "copilot aborted: " + data.Reason})
+		return
 	}
 	emit(Event{Kind: KindError, Text: fallback})
 }
@@ -246,6 +535,19 @@ func (CopilotHarness) Env(baseURL string) []string {
 	env = append(env, passthroughEnv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")...)
 	if baseURL != "" {
 		env = append(env, "COPILOT_PROVIDER_BASE_URL="+baseURL)
+		env = append(env, passthroughEnv(
+			"COPILOT_PROVIDER_API_KEY",
+			"COPILOT_PROVIDER_BEARER_TOKEN",
+			"COPILOT_PROVIDER_TYPE",
+			"COPILOT_PROVIDER_WIRE_API",
+			"COPILOT_PROVIDER_TRANSPORT",
+			"COPILOT_PROVIDER_AZURE_API_VERSION",
+			"COPILOT_PROVIDER_MODEL_ID",
+			"COPILOT_PROVIDER_WIRE_MODEL",
+			"COPILOT_PROVIDER_MAX_PROMPT_TOKENS",
+			"COPILOT_PROVIDER_MAX_OUTPUT_TOKENS",
+			"COPILOT_PROVIDER_HEADERS",
+		)...)
 	}
 	return env
 }
@@ -255,32 +557,22 @@ func (CopilotHarness) StateEnv(dir string) []string {
 }
 
 func (CopilotHarness) DefaultModels() []ModelDefault {
-	// These IDs are accepted by Copilot CLI 1.0.75. Dotted Anthropic IDs are
+	// These IDs are accepted by Copilot CLI 1.0.80. Dotted Anthropic IDs are
 	// distinct from Claude Code's hyphenated provider IDs.
 	return []ModelDefault{
-		{Name: "Claude Sonnet 4.6", ID: "claude-sonnet-4.6", Tier: "high"},
-		{Name: "Claude Haiku 4.5", ID: "claude-haiku-4.5", Tier: "mid"},
-		{Name: "Claude Opus 4.6", ID: "claude-opus-4.6", Tier: "max"},
+		{Name: "Claude Sonnet 4.6", ID: "claude-sonnet-4.6", Tier: "mid"},
+		{Name: "Claude Opus 4.6", ID: "claude-opus-4.6", Tier: "high"},
+		{Name: "Claude Opus 4.7", ID: "claude-opus-4.7"},
+		{Name: "Claude Opus 4.8", ID: "claude-opus-4.8"},
+		{Name: "Claude Opus 5.0", ID: "claude-opus-5", Tier: "max"},
+		{Name: "Claude Sonnet 5.0", ID: "claude-sonnet-5"},
+		{Name: "Claude Haiku 4.5", ID: "claude-haiku-4.5"},
+		{Name: "Claude Fable 5", ID: "claude-fable-5"},
 		{Name: "GPT-5.3 Codex", ID: "gpt-5.3-codex"},
 		{Name: "GPT-5.4", ID: "gpt-5.4"},
 	}
 }
 
-// copilotAccountPhrases cover authentication, entitlement, and request-limit
-// failures where an immediate retry is unlikely to help.
-var copilotAccountPhrases = []string{
-	"rate limit",
-	"too many requests",
-	"quota",
-	"not entitled",
-	"copilot access",
-	"authentication failed",
-	"unauthorized",
-	"forbidden",
-	"token expired",
-	"429",
-}
-
 func (CopilotHarness) AccountErrorText(s string) string {
-	return matchAccountPhrase(s, copilotAccountPhrases)
+	return matchAccountPhrase(s, transientLimitPhrases, accessRevokedPhrases)
 }

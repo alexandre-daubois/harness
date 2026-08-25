@@ -27,18 +27,30 @@ var transientLimitPhrases = []string{
 	"rate limit",
 	"rate_limit",
 	"too many requests",
+	"quota",
 	"quota exceeded",
+	"quota_exceeded",
+	"session quota exceeded",
+	"session_quota_exceeded",
 	"credit balance",
 	"429",
 }
 
-// accessRevokedPhrases identify account problems that need operator action,
-// not an automatic retry after a reset time.
+// accessRevokedPhrases identify permanent account problems that need operator
+// action, not an automatic retry after a reset time.
 var accessRevokedPhrases = []string{
 	"disabled claude subscription access",
 	"use an anthropic api key instead",
 	"ask your admin to enable access",
 	"access has been revoked",
+	"not entitled",
+	"copilot access",
+	"authentication failed",
+	"unauthorized",
+	"forbidden",
+	"token expired",
+	"billing not configured",
+	"billing_not_configured",
 }
 
 // matchAccountPhrase returns the trimmed input when any phrase matches. Callers

@@ -484,6 +484,28 @@ func TestCopilotStreamSurfacesMalformedAndUnknownEvents(t *testing.T) {
 	}
 }
 
+func TestCopilotStreamSuppressesTaskCompleteAllowlistWarning(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"session.info","data":{"infoType":"configuration","message":"Unknown tool name in the tool allowlist: \"task_complete\""}}`,
+		`{"type":"session.info","data":{"infoType":"configuration","message":"Disabled tools: bash"}}`,
+		`{"type":"session.warning","data":{"message":"Unknown tool name in the tool allowlist: \"other\""}}`,
+	}, "\n")
+
+	var events []Event
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		events = append(events, event)
+	})
+	if len(events) != 2 {
+		t.Fatalf("events = %+v", events)
+	}
+	if events[0].Text != "Disabled tools: bash" ||
+		events[1].Text != `Unknown tool name in the tool allowlist: "other"` {
+		t.Errorf("events = %+v", events)
+	}
+}
+
 func TestCopilotEnvIncludesBYOKConfiguration(t *testing.T) {
 	keys := []string{
 		"COPILOT_GITHUB_TOKEN",

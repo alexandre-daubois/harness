@@ -98,7 +98,8 @@ func copilotAvailableTools(j Job) string {
 	// Copilot 1.0.80 reports task_complete as an unknown allowlist name, but
 	// omitting it makes restricted autopilot runs fail because the mode still
 	// requires that control tool. Preserve the working behavior until the CLI
-	// treats its built-in control consistently.
+	// treats its built-in control consistently. ParseStream suppresses only the
+	// resulting known-spurious configuration warning.
 	appendTool("task_complete")
 	return strings.Join(tools, ",")
 }
@@ -233,6 +234,8 @@ type copilotAbortData struct {
 type copilotInfoData struct {
 	Message string `json:"message"`
 }
+
+const copilotTaskCompleteAllowlistWarning = `Unknown tool name in the tool allowlist: "task_complete"`
 
 type copilotModelCallFailureData struct {
 	ErrorCode      string                          `json:"errorCode"`
@@ -466,6 +469,9 @@ func handleCopilotInfo(raw json.RawMessage, fallback string, emit func(Event)) {
 	}
 	if data.Message == "" {
 		emit(Event{Kind: KindText, Text: fallback})
+		return
+	}
+	if data.Message == copilotTaskCompleteAllowlistWarning {
 		return
 	}
 	emit(Event{Kind: KindText, Text: data.Message})

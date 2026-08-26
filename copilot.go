@@ -118,7 +118,8 @@ func (CopilotHarness) ParseStream(r io.Reader, emit func(Event)) {
 	}
 	scanJSONL(r, emit, state.parseLine)
 	if state.sawTerminal {
-		state.result.CostUSD = state.estimatedCostUSD
+		unreportedTokens, unreportedCostUSD := state.unreportedMessageOutput()
+		state.result.CostUSD = state.estimatedCostUSD + unreportedCostUSD
 		if state.sawUsageCheckpoint {
 			state.result.CostUSD = state.checkpointCostUSD
 		}
@@ -127,7 +128,7 @@ func (CopilotHarness) ParseStream(r io.Reader, emit func(Event)) {
 		if state.sawBilledUsage {
 			state.result.CostUSD = state.billedCostUSD
 		}
-		state.result.Usage.OutputTokens += state.unreportedMessageOutputTokenTotal()
+		state.result.Usage.OutputTokens += unreportedTokens
 		emit(state.result)
 	}
 }
@@ -150,8 +151,10 @@ type copilotStreamState struct {
 	resultChunks          []string
 	messageReasoning      map[string]string
 	messageOutputTokens   map[string]int
+	messageOutputModels   map[string]string
 	usageOutputAPICalls   map[string]struct{}
 	unkeyedOutputTokens   int
+	unkeyedOutputCostUSD  float64
 	sawUnkeyedUsageOutput bool
 	estimatedCostUSD      float64
 	checkpointCostUSD     float64
@@ -167,6 +170,7 @@ type copilotMessageData struct {
 	ChunkIndex    *int   `json:"chunkIndex"`
 	Content       string `json:"content"`
 	MessageID     string `json:"messageId"`
+	Model         string `json:"model"`
 	OutputTokens  *int   `json:"outputTokens"`
 	ReasoningText string `json:"reasoningText"`
 }
@@ -555,27 +559,37 @@ func (state *copilotStreamState) recordMessageOutput(data copilotMessageData) {
 	}
 	if key == "" {
 		state.unkeyedOutputTokens += *data.OutputTokens
+		state.unkeyedOutputCostUSD += CostFromUsage(data.Model, Usage{OutputTokens: *data.OutputTokens})
 		return
 	}
 	if state.messageOutputTokens == nil {
 		state.messageOutputTokens = make(map[string]int)
+		state.messageOutputModels = make(map[string]string)
 	}
 	if *data.OutputTokens > state.messageOutputTokens[key] {
 		state.messageOutputTokens[key] = *data.OutputTokens
 	}
+	if data.Model != "" {
+		state.messageOutputModels[key] = data.Model
+	}
 }
 
-func (state *copilotStreamState) unreportedMessageOutputTokenTotal() int {
+func (state *copilotStreamState) unreportedMessageOutput() (int, float64) {
 	if state.sawUnkeyedUsageOutput {
-		return 0
+		return 0, 0
 	}
 	total := state.unkeyedOutputTokens
+	costUSD := state.unkeyedOutputCostUSD
 	for apiCallID, tokens := range state.messageOutputTokens {
 		if _, reported := state.usageOutputAPICalls[apiCallID]; !reported {
 			total += tokens
+			costUSD += CostFromUsage(
+				state.messageOutputModels[apiCallID],
+				Usage{OutputTokens: tokens},
+			)
 		}
 	}
-	return total
+	return total, costUSD
 }
 
 func (state *copilotStreamState) addUsage(data copilotUsageData) {

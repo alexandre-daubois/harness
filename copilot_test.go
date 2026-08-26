@@ -286,6 +286,30 @@ func TestCopilotStreamUsesPerCallBillingAndMessageOutput(t *testing.T) {
 	}
 }
 
+func TestCopilotStreamEstimatesRecoveredMessageOutputCost(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.message","data":{"apiCallId":"root-call","model":"claude-sonnet-4.6","content":"answer","outputTokens":100}}`,
+		`{"type":"assistant.usage","data":{"apiCallId":"root-call","model":"claude-sonnet-4.6","inputTokens":100}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var result Event
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		if event.Kind == KindResult {
+			result = event
+		}
+	})
+	if result.Usage.OutputTokens != 100 {
+		t.Errorf("output tokens = %d, want 100", result.Usage.OutputTokens)
+	}
+	const wantCostUSD = 0.0018
+	if math.Abs(result.CostUSD-wantCostUSD) > 1e-12 {
+		t.Errorf("cost = %.12f, want %.12f", result.CostUSD, wantCostUSD)
+	}
+}
+
 func TestCopilotStreamFiltersSubagentConversation(t *testing.T) {
 	t.Parallel()
 

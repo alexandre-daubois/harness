@@ -781,19 +781,34 @@ func (CopilotHarness) StateEnv(dir string) []string {
 }
 
 func (CopilotHarness) DefaultModels() []ModelDefault {
-	// These IDs are accepted by Copilot CLI 1.0.80. Dotted Anthropic IDs are
-	// distinct from Claude Code's hyphenated provider IDs.
+	// This is Copilot CLI 1.0.80's /model --list --json catalog. The reported
+	// current model, GPT-5.6 Sol, is moved first because callers treat the first
+	// entry as the default. Dotted Anthropic IDs are distinct from Claude Code's
+	// hyphenated IDs.
 	return []ModelDefault{
+		{Name: "GPT-5.6 Sol", ID: "gpt-5.6-sol"},
+		{Name: "Claude Sonnet 5", ID: "claude-sonnet-5"},
+		{Name: "Claude Opus 5", ID: "claude-opus-5", Tier: "max"},
+		{Name: "Claude Opus 4.8", ID: "claude-opus-4.8"},
+		{Name: "Claude Opus 4.7", ID: "claude-opus-4.7"},
 		{Name: "Claude Sonnet 4.6", ID: "claude-sonnet-4.6", Tier: "mid"},
 		{Name: "Claude Opus 4.6", ID: "claude-opus-4.6", Tier: "high"},
-		{Name: "Claude Opus 4.7", ID: "claude-opus-4.7"},
-		{Name: "Claude Opus 4.8", ID: "claude-opus-4.8"},
-		{Name: "Claude Opus 5.0", ID: "claude-opus-5", Tier: "max"},
-		{Name: "Claude Sonnet 5.0", ID: "claude-sonnet-5"},
 		{Name: "Claude Haiku 4.5", ID: "claude-haiku-4.5"},
-		{Name: "Claude Fable 5", ID: "claude-fable-5"},
-		{Name: "GPT-5.3 Codex", ID: "gpt-5.3-codex"},
+		{Name: "GPT-5.6 Terra", ID: "gpt-5.6-terra"},
+		{Name: "GPT-5.6 Luna", ID: "gpt-5.6-luna"},
+		{Name: "GPT-5.5", ID: "gpt-5.5"},
 		{Name: "GPT-5.4", ID: "gpt-5.4"},
+		{Name: "GPT-5.4 mini", ID: "gpt-5.4-mini"},
+		{Name: "GPT-5.3-Codex", ID: "gpt-5.3-codex"},
+		{Name: "GPT-5 mini", ID: "gpt-5-mini"},
+		{Name: "MAI-Code-1-Flash", ID: "mai-code-1-flash-picker"},
+		{Name: "Gemini 3.7 Flash", ID: "gemini-3.7-flash"},
+		{Name: "Gemini 3.6 Flash", ID: "gemini-3.6-flash"},
+		{Name: "Gemini 3.5 Flash", ID: "gemini-3.5-flash"},
+		{Name: "Gemini 3.1 Pro Preview", ID: "gemini-3.1-pro-preview"},
+		{Name: "Grok 4.5", ID: "grok-4.5"},
+		{Name: "Grok 4.6", ID: "grok-4.6"},
+		{Name: "MAI-Code-1.1-Flash", ID: "mai-code-1.1-flash"},
 	}
 }
 

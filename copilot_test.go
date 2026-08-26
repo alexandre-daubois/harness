@@ -572,7 +572,63 @@ func TestCopilotDefaultModelTiers(t *testing.T) {
 	t.Parallel()
 
 	models := CopilotHarness{}.DefaultModels()
-	if len(models) == 0 || models[0].ID != "claude-sonnet-4.6" {
+	wantIDs := []string{
+		"gpt-5.6-sol",
+		"claude-sonnet-5",
+		"claude-opus-5",
+		"claude-opus-4.8",
+		"claude-opus-4.7",
+		"claude-sonnet-4.6",
+		"claude-opus-4.6",
+		"claude-haiku-4.5",
+		"gpt-5.6-terra",
+		"gpt-5.6-luna",
+		"gpt-5.5",
+		"gpt-5.4",
+		"gpt-5.4-mini",
+		"gpt-5.3-codex",
+		"gpt-5-mini",
+		"mai-code-1-flash-picker",
+		"gemini-3.7-flash",
+		"gemini-3.6-flash",
+		"gemini-3.5-flash",
+		"gemini-3.1-pro-preview",
+		"grok-4.5",
+		"grok-4.6",
+		"mai-code-1.1-flash",
+	}
+	wantNames := []string{
+		"GPT-5.6 Sol",
+		"Claude Sonnet 5",
+		"Claude Opus 5",
+		"Claude Opus 4.8",
+		"Claude Opus 4.7",
+		"Claude Sonnet 4.6",
+		"Claude Opus 4.6",
+		"Claude Haiku 4.5",
+		"GPT-5.6 Terra",
+		"GPT-5.6 Luna",
+		"GPT-5.5",
+		"GPT-5.4",
+		"GPT-5.4 mini",
+		"GPT-5.3-Codex",
+		"GPT-5 mini",
+		"MAI-Code-1-Flash",
+		"Gemini 3.7 Flash",
+		"Gemini 3.6 Flash",
+		"Gemini 3.5 Flash",
+		"Gemini 3.1 Pro Preview",
+		"Grok 4.5",
+		"Grok 4.6",
+		"MAI-Code-1.1-Flash",
+	}
+	gotIDs := make([]string, len(models))
+	gotNames := make([]string, len(models))
+	for i, model := range models {
+		gotIDs[i] = model.ID
+		gotNames[i] = model.Name
+	}
+	if !slices.Equal(gotIDs, wantIDs) || !slices.Equal(gotNames, wantNames) {
 		t.Fatalf("default models = %+v", models)
 	}
 	wantTiers := map[string]string{

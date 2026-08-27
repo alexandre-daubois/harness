@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // CopilotHarness drives GitHub Copilot CLI in non-interactive prompt mode.
@@ -115,11 +117,24 @@ type copilotToolData struct {
 }
 
 type copilotUsageData struct {
-	Model            string `json:"model"`
-	InputTokens      int    `json:"inputTokens"`
-	OutputTokens     int    `json:"outputTokens"`
-	CacheReadTokens  int    `json:"cacheReadTokens"`
-	CacheWriteTokens int    `json:"cacheWriteTokens"`
+	Model            string                          `json:"model"`
+	InputTokens      int                             `json:"inputTokens"`
+	OutputTokens     int                             `json:"outputTokens"`
+	CacheReadTokens  int                             `json:"cacheReadTokens"`
+	CacheWriteTokens int                             `json:"cacheWriteTokens"`
+	QuotaSnapshots   map[string]copilotQuotaSnapshot `json:"quotaSnapshots"`
+}
+
+type copilotQuotaSnapshot struct {
+	HasQuota                         *bool    `json:"hasQuota"`
+	EntitlementRequests              *float64 `json:"entitlementRequests"`
+	IsUnlimitedEntitlement           bool     `json:"isUnlimitedEntitlement"`
+	Overage                          float64  `json:"overage"`
+	OverageAllowedWithExhaustedQuota bool     `json:"overageAllowedWithExhaustedQuota"`
+	RemainingPercentage              *float64 `json:"remainingPercentage"`
+	ResetDate                        string   `json:"resetDate"`
+	UsageAllowedWithExhaustedQuota   bool     `json:"usageAllowedWithExhaustedQuota"`
+	UsedRequests                     *float64 `json:"usedRequests"`
 }
 
 type copilotUsageCheckpointData struct {
@@ -143,12 +158,13 @@ type copilotInfoData struct {
 }
 
 type copilotModelCallFailureData struct {
-	ErrorCode    string `json:"errorCode"`
-	ErrorMessage string `json:"errorMessage"`
-	ErrorType    string `json:"errorType"`
-	FailureKind  string `json:"failureKind"`
-	Model        string `json:"model"`
-	StatusCode   *int   `json:"statusCode"`
+	ErrorCode      string                          `json:"errorCode"`
+	ErrorMessage   string                          `json:"errorMessage"`
+	ErrorType      string                          `json:"errorType"`
+	FailureKind    string                          `json:"failureKind"`
+	Model          string                          `json:"model"`
+	QuotaSnapshots map[string]copilotQuotaSnapshot `json:"quotaSnapshots"`
+	StatusCode     *int                            `json:"statusCode"`
 }
 
 func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
@@ -174,6 +190,7 @@ func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
 		var data copilotUsageData
 		if json.Unmarshal(event.Data, &data) == nil {
 			state.addUsage(data)
+			emitCopilotRateLimits(data.QuotaSnapshots, emit)
 		}
 	case "session.usage_checkpoint":
 		var data copilotUsageCheckpointData
@@ -323,6 +340,57 @@ func copilotNanoAIUCostUSD(totalNanoAIU float64) float64 {
 	return totalNanoAIU / nanoAIUPerAICredit * usdPerAICredit
 }
 
+// emitCopilotRateLimits maps exhausted Copilot quota snapshots to rate-limit
+// events so callers can schedule a resume after ResetDate.
+func emitCopilotRateLimits(snapshots map[string]copilotQuotaSnapshot, emit func(Event)) {
+	keys := make([]string, 0, len(snapshots))
+	for key, snapshot := range snapshots {
+		if copilotQuotaExhausted(snapshot) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		snapshot := snapshots[key]
+		status := "allowed"
+		if !snapshot.UsageAllowedWithExhaustedQuota &&
+			!snapshot.OverageAllowedWithExhaustedQuota {
+			status = "rejected"
+		}
+		overageStatus := "rejected"
+		if snapshot.OverageAllowedWithExhaustedQuota {
+			overageStatus = "allowed"
+		}
+		info := &RateLimitInfo{
+			Status:         status,
+			OverageStatus:  overageStatus,
+			IsUsingOverage: snapshot.Overage > 0 && snapshot.OverageAllowedWithExhaustedQuota,
+			Type:           key,
+		}
+		if reset, err := time.Parse(time.RFC3339, snapshot.ResetDate); err == nil {
+			info.ResetsAt = reset.Unix()
+		}
+		emit(Event{Kind: KindRateLimit, RateLimit: info})
+	}
+}
+
+func copilotQuotaExhausted(snapshot copilotQuotaSnapshot) bool {
+	// hasQuota:false indicates exhaustion only for a limited entitlement.
+	if snapshot.IsUnlimitedEntitlement {
+		return false
+	}
+	if snapshot.HasQuota != nil {
+		return !*snapshot.HasQuota
+	}
+	if snapshot.RemainingPercentage != nil && *snapshot.RemainingPercentage <= 0 {
+		return true
+	}
+	if snapshot.EntitlementRequests != nil && snapshot.UsedRequests != nil {
+		return *snapshot.UsedRequests >= *snapshot.EntitlementRequests
+	}
+	return false
+}
+
 func emitCopilotIntent(event *copilotLine, emit func(Event)) {
 	var data copilotIntentData
 	if event.AgentID == "" && json.Unmarshal(event.Data, &data) == nil && data.Intent != "" {
@@ -363,6 +431,7 @@ func emitCopilotModelCallFailure(raw json.RawMessage, emit func(Event)) {
 	if json.Unmarshal(raw, &data) != nil {
 		return
 	}
+	emitCopilotRateLimits(data.QuotaSnapshots, emit)
 	text := data.ErrorMessage
 	if text == "" {
 		text = "model call failed"

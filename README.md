@@ -15,8 +15,8 @@ and event parser.
 | `copilot` | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | `.github/skills/<name>` | `.github/copilot-instructions.md` | `github.com`, `api.github.com`, `api.mcp.github.com`, `*.githubcopilot.com` |
 | `opencode` | `opencode` | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_AUTH_CONTENT` | `.opencode/skill/<name>` | `AGENTS.md` | `models.dev`, `api.openai.com`, `*.anthropic.com` |
 
-The Copilot parser targets CLI 1.0.75 or later, where
-`--output-format json` emits JSONL in prompt mode.
+The Copilot adapter targets CLI 1.0.80 and remains compatible with the
+prompt-mode JSONL stream introduced in 1.0.75.
 
 The library owns the details that differ between CLIs: binary names, arguments,
 credential and state environment variables, project instruction files, skill
@@ -65,9 +65,10 @@ is already the repository root. `SkillName` selects a staged `SKILL.md`; when
 uses `--system-prompt` with Claude and the backend's project instruction file
 for the other CLIs.
 
-`MaxTurns` uses the backend default when set to zero. `Effort` and
-`AllowedTools` currently apply only to Claude. `ResumeSessionID` and
-`ResumePrompt` continue an existing conversation.
+`MaxTurns` uses the backend default when set to zero; Copilot maps it to maximum
+autopilot continuations. `Effort` applies to Claude and Copilot. `AllowedTools`
+applies only to Claude. `ResumeSessionID` and `ResumePrompt` continue an
+existing conversation.
 
 The `Harness` interface exposes the parts needed by local, container, and remote
 runners:
@@ -115,7 +116,9 @@ type Event struct {
 Kinds are `thinking`, `text`, `tool`, `result`, `error`, `session`, and
 `rate_limit`. `FormatEvent` renders an event for a plain-text log.
 `CostFromUsage` calculates a list-price estimate when the CLI reports tokens
-without a dollar amount.
+without a dollar amount. Copilot's `CostUSD` uses the latest cumulative
+`session.usage_checkpoint` when one is present, so on a resumed Copilot session
+the reported cost is session-cumulative rather than per-invocation.
 
 ## Run a local subprocess
 

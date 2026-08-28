@@ -52,8 +52,9 @@ func (CopilotHarness) Prompt(j Job) string {
 }
 
 // ParseStream combines per-call token usage and cumulative billing checkpoints
-// into one result emitted after Copilot's final envelope. This gives callers
-// the same single-run totals exposed by the other backends.
+// into one result emitted after Copilot's final envelope. Sub-agent calls
+// remain part of the usage total, but their nested conversation events stay out
+// of the parent stream.
 func (CopilotHarness) ParseStream(r io.Reader, emit func(Event)) {
 	state := copilotStreamState{result: Event{Kind: KindResult}}
 	scanJSONL(r, emit, state.parseLine)
@@ -72,6 +73,9 @@ func (CopilotHarness) ParseStream(r io.Reader, emit func(Event)) {
 type copilotLine struct {
 	Type      string          `json:"type"`
 	Data      json.RawMessage `json:"data"`
+	AgentID   string          `json:"agentId"`
+	ID        string          `json:"id"`
+	ParentID  string          `json:"parentId"`
 	SessionID string          `json:"sessionId"`
 	ExitCode  *int            `json:"exitCode"`
 }
@@ -79,6 +83,9 @@ type copilotLine struct {
 // copilotStreamState accumulates the terminal result across the JSONL stream.
 type copilotStreamState struct {
 	result            Event
+	resultCallID      string
+	resultChunks      []string
+	messageReasoning  map[string]string
 	estimatedCostUSD  float64
 	checkpointCostUSD float64
 	sawCheckpoint     bool
@@ -86,12 +93,20 @@ type copilotStreamState struct {
 }
 
 type copilotMessageData struct {
+	APICallID     string `json:"apiCallId"`
+	ChunkCount    *int   `json:"chunkCount"`
+	ChunkIndex    *int   `json:"chunkIndex"`
 	Content       string `json:"content"`
+	MessageID     string `json:"messageId"`
 	ReasoningText string `json:"reasoningText"`
 }
 
 type copilotReasoningData struct {
 	Content string `json:"content"`
+}
+
+type copilotIntentData struct {
+	Intent string `json:"intent"`
 }
 
 type copilotToolData struct {
@@ -112,8 +127,28 @@ type copilotUsageCheckpointData struct {
 }
 
 type copilotErrorData struct {
+	Message    string          `json:"message"`
+	Error      json.RawMessage `json:"error"`
+	ErrorType  string          `json:"errorType"`
+	ErrorCode  string          `json:"errorCode"`
+	StatusCode *int            `json:"statusCode"`
+}
+
+type copilotAbortData struct {
+	Reason string `json:"reason"`
+}
+
+type copilotInfoData struct {
 	Message string `json:"message"`
-	Error   string `json:"error"`
+}
+
+type copilotModelCallFailureData struct {
+	ErrorCode    string `json:"errorCode"`
+	ErrorMessage string `json:"errorMessage"`
+	ErrorType    string `json:"errorType"`
+	FailureKind  string `json:"failureKind"`
+	Model        string `json:"model"`
+	StatusCode   *int   `json:"statusCode"`
 }
 
 func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
@@ -128,21 +163,13 @@ func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
 	}
 	switch event.Type {
 	case "assistant.message":
-		emitCopilotMessage(event.Data, emit)
+		state.handleMessage(&event, emit)
 	case "assistant.reasoning":
-		var data copilotReasoningData
-		if json.Unmarshal(event.Data, &data) == nil && data.Content != "" {
-			emit(Event{Kind: KindThinking, Text: data.Content})
-		}
+		state.handleReasoning(&event, emit)
+	case "assistant.intent":
+		emitCopilotIntent(&event, emit)
 	case "tool.execution_start":
-		var data copilotToolData
-		if json.Unmarshal(event.Data, &data) == nil {
-			emit(Event{
-				Kind: KindTool,
-				Tool: data.ToolName,
-				Text: summariseInput(data.ToolName, data.Arguments),
-			})
-		}
+		emitCopilotTool(&event, emit)
 	case "assistant.usage":
 		var data copilotUsageData
 		if json.Unmarshal(event.Data, &data) == nil {
@@ -157,7 +184,9 @@ func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
 			state.sawCheckpoint = true
 		}
 	case "assistant.turn_end":
-		state.result.Turns++
+		if event.AgentID == "" {
+			state.result.Turns++
+		}
 	case "result":
 		state.sawTerminal = true
 		if event.SessionID != "" {
@@ -166,25 +195,107 @@ func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
 		if event.ExitCode != nil && *event.ExitCode != 0 {
 			emit(Event{Kind: KindError, Text: fmt.Sprintf("copilot exited with code %d", *event.ExitCode)})
 		}
-	case "abort", "session.error", "error":
+	case "model.call_failure":
+		emitCopilotModelCallFailure(event.Data, emit)
+	case "session.error", "error":
 		emitCopilotError(event.Data, line, emit)
+	case "abort":
+		emitCopilotAbort(event.Data, line, emit)
+	case "session.info", "session.warning":
+		emitCopilotInfo(event.Data, emit)
 	case "assistant.message_delta",
 		"assistant.message_start",
 		"assistant.reasoning_delta",
+		"assistant.streaming_delta",
 		"assistant.tool_call_delta",
 		"assistant.turn_start",
 		"assistant.idle",
 		"model.call_start",
 		"model.call_end",
+		"mcp.prompts.list_changed",
+		"mcp.resources.list_changed",
+		"mcp.tools.list_changed",
+		"session.idle",
 		"session.mcp_server_status_changed",
 		"session.mcp_servers_loaded",
 		"session.skills_loaded",
+		"session.task_complete",
 		"session.tools_updated",
 		"session.usage_info",
+		"tool.execution_complete",
+		"tool.execution_partial_result",
+		"tool.execution_progress",
 		"user.message":
 	default:
 		emit(Event{Kind: KindText, Text: line})
 	}
+}
+
+func (state *copilotStreamState) handleMessage(event *copilotLine, emit func(Event)) {
+	var data copilotMessageData
+	if json.Unmarshal(event.Data, &data) != nil || event.AgentID != "" {
+		return
+	}
+	if event.ID != "" && data.ReasoningText != "" {
+		if state.messageReasoning == nil {
+			state.messageReasoning = make(map[string]string)
+		}
+		state.messageReasoning[event.ID] = data.ReasoningText
+	}
+	if data.ReasoningText != "" {
+		emit(Event{Kind: KindThinking, Text: data.ReasoningText})
+	}
+	if data.Content != "" {
+		emit(Event{Kind: KindText, Text: data.Content})
+		state.recordResultText(data)
+	}
+}
+
+func (state *copilotStreamState) handleReasoning(event *copilotLine, emit func(Event)) {
+	if event.AgentID != "" {
+		return
+	}
+	var data copilotReasoningData
+	if json.Unmarshal(event.Data, &data) != nil || data.Content == "" {
+		return
+	}
+	if event.ParentID != "" {
+		if reasoning, ok := state.messageReasoning[event.ParentID]; ok {
+			delete(state.messageReasoning, event.ParentID)
+			if data.Content == reasoning {
+				return
+			}
+		}
+	}
+	emit(Event{Kind: KindThinking, Text: data.Content})
+}
+
+// recordResultText tracks the final assistant response. A model call can emit
+// several complete message records around reasoning boundaries; those chunks
+// are reassembled by index. A later API call replaces the result rather than
+// appending to it so Text remains the final response, not a transcript.
+func (state *copilotStreamState) recordResultText(data copilotMessageData) {
+	callID := data.APICallID
+	if callID == "" {
+		callID = data.MessageID
+	}
+	if callID == "" ||
+		data.ChunkCount == nil ||
+		data.ChunkIndex == nil ||
+		*data.ChunkCount <= 1 ||
+		*data.ChunkIndex < 0 ||
+		*data.ChunkIndex >= *data.ChunkCount {
+		state.resultCallID = callID
+		state.resultChunks = nil
+		state.result.Text = data.Content
+		return
+	}
+	if state.resultCallID != callID || len(state.resultChunks) != *data.ChunkCount {
+		state.resultCallID = callID
+		state.resultChunks = make([]string, *data.ChunkCount)
+	}
+	state.resultChunks[*data.ChunkIndex] = data.Content
+	state.result.Text = strings.Join(state.resultChunks, "")
 }
 
 func (state *copilotStreamState) addUsage(data copilotUsageData) {
@@ -212,32 +323,107 @@ func copilotNanoAIUCostUSD(totalNanoAIU float64) float64 {
 	return totalNanoAIU / nanoAIUPerAICredit * usdPerAICredit
 }
 
-func emitCopilotMessage(raw json.RawMessage, emit func(Event)) {
-	var data copilotMessageData
+func emitCopilotIntent(event *copilotLine, emit func(Event)) {
+	var data copilotIntentData
+	if event.AgentID == "" && json.Unmarshal(event.Data, &data) == nil && data.Intent != "" {
+		emit(Event{Kind: KindThinking, Text: data.Intent})
+	}
+}
+
+func emitCopilotTool(event *copilotLine, emit func(Event)) {
+	var data copilotToolData
+	if event.AgentID != "" || json.Unmarshal(event.Data, &data) != nil || data.ToolName == "" {
+		return
+	}
+	emit(Event{
+		Kind: KindTool,
+		Tool: data.ToolName,
+		Text: summariseInput(data.ToolName, data.Arguments),
+	})
+}
+
+func emitCopilotInfo(raw json.RawMessage, emit func(Event)) {
+	var data copilotInfoData
+	if json.Unmarshal(raw, &data) == nil && data.Message != "" {
+		emit(Event{Kind: KindText, Text: data.Message})
+	}
+}
+
+func emitCopilotAbort(raw json.RawMessage, fallback string, emit func(Event)) {
+	var data copilotAbortData
+	if json.Unmarshal(raw, &data) == nil && data.Reason != "" {
+		emit(Event{Kind: KindError, Text: "copilot aborted: " + data.Reason})
+		return
+	}
+	emit(Event{Kind: KindError, Text: fallback})
+}
+
+func emitCopilotModelCallFailure(raw json.RawMessage, emit func(Event)) {
+	var data copilotModelCallFailureData
 	if json.Unmarshal(raw, &data) != nil {
 		return
 	}
-	if data.ReasoningText != "" {
-		emit(Event{Kind: KindThinking, Text: data.ReasoningText})
+	text := data.ErrorMessage
+	if text == "" {
+		text = "model call failed"
 	}
-	if data.Content != "" {
-		emit(Event{Kind: KindText, Text: data.Content})
-	}
+	emit(Event{
+		Kind: KindError,
+		Text: text + copilotErrorDetails(
+			data.Model, data.FailureKind, data.ErrorType, data.ErrorCode, data.StatusCode,
+		),
+	})
 }
 
 func emitCopilotError(raw json.RawMessage, fallback string, emit func(Event)) {
 	var data copilotErrorData
 	if json.Unmarshal(raw, &data) == nil {
-		if data.Message != "" {
-			emit(Event{Kind: KindError, Text: data.Message})
-			return
+		text := data.Message
+		if text == "" {
+			text = copilotNestedErrorText(data.Error)
 		}
-		if data.Error != "" {
-			emit(Event{Kind: KindError, Text: data.Error})
+		if text != "" {
+			emit(Event{
+				Kind: KindError,
+				Text: text + copilotErrorDetails("", "", data.ErrorType, data.ErrorCode, data.StatusCode),
+			})
 			return
 		}
 	}
 	emit(Event{Kind: KindError, Text: fallback})
+}
+
+func copilotNestedErrorText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var nested struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &nested) == nil {
+		return nested.Message
+	}
+	return ""
+}
+
+func copilotErrorDetails(model, failureKind, errorType, errorCode string, statusCode *int) string {
+	var details []string
+	for _, detail := range []string{model, failureKind, errorType, errorCode} {
+		if detail != "" {
+			details = append(details, detail)
+		}
+	}
+	if statusCode != nil {
+		details = append(details, "status "+strconv.Itoa(*statusCode))
+	}
+	if len(details) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(details, ", ") + ")"
 }
 
 func (CopilotHarness) SkillDir(workspace, name string) string {

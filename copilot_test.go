@@ -95,6 +95,9 @@ func TestCopilotStreamFixture(t *testing.T) {
 	if events[4].Turns != 1 || events[4].Usage.CacheReadTokens != 80 {
 		t.Errorf("result event = %+v", events[4])
 	}
+	if events[4].Text != "Done." {
+		t.Errorf("result text = %q", events[4].Text)
+	}
 	if events[4].CostUSD <= 0 {
 		t.Errorf("result cost = %f, want a list-price estimate", events[4].CostUSD)
 	}
@@ -169,6 +172,132 @@ func TestCopilotStreamUsesLatestUsageCheckpointCost(t *testing.T) {
 	const wantCostUSD = 0.08148135
 	if math.Abs(result.CostUSD-wantCostUSD) > 1e-12 {
 		t.Errorf("cost = %.12f, want checkpoint %.12f", result.CostUSD, wantCostUSD)
+	}
+}
+
+func TestCopilotStreamReassemblesMessageChunks(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.message","data":{"apiCallId":"old-call","content":"old response"}}`,
+		`{"type":"assistant.message","data":{"apiCallId":"final-call","chunkIndex":1,"chunkCount":3,"content":"middle "}}`,
+		`{"type":"assistant.message","data":{"apiCallId":"final-call","chunkIndex":0,"chunkCount":3,"content":"first "}}`,
+		`{"type":"assistant.message","data":{"apiCallId":"final-call","chunkIndex":2,"chunkCount":3,"content":"last"}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var result Event
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		if event.Kind == KindResult {
+			result = event
+		}
+	})
+	if result.Text != "first middle last" {
+		t.Errorf("result text = %q, want reassembled final model call", result.Text)
+	}
+
+	stream = strings.Join([]string{
+		`{"type":"assistant.message","data":{"messageId":"m","chunkIndex":0,"chunkCount":2,"content":"a"}}`,
+		`{"type":"assistant.message","data":{"messageId":"m","chunkIndex":1,"chunkCount":2,"content":"b"}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		if event.Kind == KindResult {
+			result = event
+		}
+	})
+	if result.Text != "ab" {
+		t.Errorf("result text = %q, want messageId fallback reassembly", result.Text)
+	}
+}
+
+func TestCopilotStreamDeduplicatesMessageReasoning(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.message","id":"message-event","data":{"apiCallId":"call-1","reasoningText":"checking","content":"done"}}`,
+		`{"type":"assistant.reasoning","parentId":"message-event","data":{"reasoningId":"reasoning-1","content":"checking"}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var thinking []string
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		if event.Kind == KindThinking {
+			thinking = append(thinking, event.Text)
+		}
+	})
+	if !slices.Equal(thinking, []string{"checking"}) {
+		t.Errorf("thinking events = %q, want one copy", thinking)
+	}
+}
+
+func TestCopilotStreamFiltersSubagentConversation(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.intent","data":{"intent":"Checking the parent task."}}`,
+		`{"type":"assistant.message","agentId":"child-1","data":{"content":"nested answer"}}`,
+		`{"type":"assistant.reasoning","agentId":"child-1","data":{"content":"nested reasoning"}}`,
+		`{"type":"tool.execution_start","agentId":"child-1","data":{"toolName":"shell","arguments":{"command":"nested"}}}`,
+		`{"type":"assistant.usage","agentId":"child-1","data":{"model":"claude-sonnet-4.6","inputTokens":50,"outputTokens":5}}`,
+		`{"type":"assistant.turn_end","agentId":"child-1","data":{"turnId":"child"}}`,
+		`{"type":"assistant.message","data":{"content":"parent answer"}}`,
+		`{"type":"assistant.turn_end","data":{"turnId":"parent"}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var events []Event
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		events = append(events, event)
+	})
+	if len(events) != 4 {
+		t.Fatalf("events = %+v", events)
+	}
+	if events[0].Kind != KindThinking || events[0].Text != "Checking the parent task." {
+		t.Errorf("intent event = %+v", events[0])
+	}
+	if events[1].Kind != KindText || events[1].Text != "parent answer" {
+		t.Errorf("parent message = %+v", events[1])
+	}
+	result := events[3]
+	if result.Kind != KindResult || result.Text != "parent answer" || result.Turns != 1 {
+		t.Errorf("result = %+v", result)
+	}
+	if result.Usage.InputTokens != 50 || result.Usage.OutputTokens != 5 {
+		t.Errorf("subagent usage was not retained: %+v", result.Usage)
+	}
+}
+
+func TestCopilotStreamErrorEvents(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"model.call_failure","data":{"errorMessage":"upstream 503","model":"gpt-5.6-sol","failureKind":"upstream","errorType":"ServiceUnavailable","statusCode":503}}`,
+		`{"type":"session.error","data":{"error":{"message":"quota exceeded"},"errorCode":"quota_exceeded","statusCode":429}}`,
+		`{"type":"abort","data":{"reason":"user cancelled"}}`,
+		`{"type":"session.warning","data":{"message":"BYOK provider missing region"}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":2}`,
+	}, "\n")
+
+	var events []Event
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		events = append(events, event)
+	})
+	want := []Event{
+		{Kind: KindError, Text: "upstream 503 (gpt-5.6-sol, upstream, ServiceUnavailable, status 503)"},
+		{Kind: KindError, Text: "quota exceeded (quota_exceeded, status 429)"},
+		{Kind: KindError, Text: "copilot aborted: user cancelled"},
+		{Kind: KindText, Text: "BYOK provider missing region"},
+		{Kind: KindSession, SessionID: "session-1"},
+		{Kind: KindError, Text: "copilot exited with code 2"},
+	}
+	if len(events) != len(want)+1 {
+		t.Fatalf("events = %+v", events)
+	}
+	for i := range want {
+		if events[i].Kind != want[i].Kind || events[i].Text != want[i].Text || events[i].SessionID != want[i].SessionID {
+			t.Errorf("event %d = %+v, want %+v", i, events[i], want[i])
+		}
 	}
 }
 

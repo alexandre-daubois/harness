@@ -199,6 +199,20 @@ func TestRunnerArgs_EnvPreservesBareKeys(t *testing.T) {
 	}
 }
 
+func TestRunnerArgs_OmitAndReplaceBackendEnv(t *testing.T) {
+	runner := Runner{
+		OmitEnv: []string{"STUB_TELEMETRY"},
+		Env:     []string{"PROVIDER_TOKEN"},
+	}
+	got := runner.args(stubHarness{}, harness.Job{Workspace: WorkMount}, "/abs/work")
+	if hasAdjacent(got, "-e", "STUB_TELEMETRY=off") {
+		t.Errorf("omitted backend env remains in args: %v", got)
+	}
+	if !hasAdjacent(got, "-e", "PROVIDER_TOKEN") {
+		t.Errorf("scoped replacement env missing from args: %v", got)
+	}
+}
+
 func TestRunnerArgs_Network(t *testing.T) {
 	// No proxy, no network -> --network none (fail closed).
 	closed := Runner{}.args(stubHarness{}, harness.Job{Workspace: WorkMount}, "/abs/work")

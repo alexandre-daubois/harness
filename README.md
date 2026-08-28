@@ -255,7 +255,13 @@ Apple's `container` CLI and applies each engine's flag differences
 `:z` bind-mount relabeling is handled via `ResolveSELinuxRelabel`, and
 `VerifyKeepID` / `VerifySELinuxMount` report host misconfiguration once during
 startup. `Runner.Hardened`
-creates a per-run internal network. Rootless podman gets a `harness-proxy`
+creates an internal network. `Runner.Run` owns that network for one backend
+invocation. Call `Runner.Open` when readiness checks or retries must share it;
+the returned `Scope` runs backends with `Run`, auxiliary commands with
+`RunCommand`, and removes its resources with `Close`. `Runner.ProcessEnv`
+supplies scoped values for bare `Runner.Env` keys without exposing them in the
+container-runtime argv, while `Runner.OmitEnv` removes inherited backend
+credentials that a caller replaces. Rootless podman gets a `harness-proxy`
 sidecar on that network, restricted to `Harness.EgressHosts()` and any extra
 hosts in `Runner.Sidecar`; other runtimes use `Runner.ProxyURL` through the
 network gateway. Runner images used for this path need curl and the

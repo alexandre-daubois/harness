@@ -66,6 +66,14 @@ type Runner struct {
 	// set, the caller owns egress enforcement (typically a --internal network
 	// paired with a proxy sidecar). Empty defers to ProxyURL.
 	Network string
+	// Hardened creates a private --internal network for this run and removes it
+	// afterwards. Rootless podman also gets an egress proxy sidecar configured
+	// by Sidecar. Other runtimes reach the caller's ProxyURL through the network
+	// gateway. Hardened implies ReadOnly and cannot be combined with Network.
+	Hardened bool
+	// Sidecar configures rootless podman's per-run egress proxy. Other runtimes
+	// ignore it because they can reach ProxyURL across an internal network.
+	Sidecar SidecarConfig
 	// ReadOnly enables --read-only rootfs and (where supported)
 	// --security-opt no-new-privileges. WorkMount, StateMount, and /tmp stay
 	// writable.
@@ -97,6 +105,25 @@ func (r Runner) Run(ctx context.Context, h harness.Harness, j harness.Job, emit 
 	if r.StateDir != "" {
 		if r.StateDir, err = filepath.Abs(r.StateDir); err != nil {
 			return fmt.Errorf("container: state dir: %w", err)
+		}
+	}
+	if r.Hardened {
+		if r.Network != "" {
+			return fmt.Errorf("container: Hardened and Network cannot both be set")
+		}
+		hardened, err := r.setupHardened(ctx, h)
+		if err != nil {
+			return fmt.Errorf("container: hardened network: %w", err)
+		}
+		defer hardened.cleanup(r.Runtime, emit)
+		r.Network = hardened.network
+		r.HostGatewayIP = hardened.gatewayIP
+		r.ReadOnly = true
+		switch {
+		case hardened.proxyEndpoint != "":
+			r.ProxyURL = egress.EndpointURL(hardened.token, hardened.proxyEndpoint)
+		case r.Runtime.Bin == runtimeApple:
+			r.ProxyURL = proxyURLWithHost(r.ProxyURL, hardened.gatewayIP)
 		}
 	}
 

@@ -253,8 +253,14 @@ the session. `DetectRuntime` resolves docker, podman (rootful or rootless), or
 Apple's `container` CLI and applies each engine's flag differences
 (`--userns=keep-id`, `--progress none`, missing `--security-opt`). SELinux
 `:z` bind-mount relabeling is handled via `ResolveSELinuxRelabel`, and
-`VerifyKeepID` / `VerifySELinuxMount` are one-time startup smoke tests so a
-misconfigured host fails early instead of on every run.
+`VerifyKeepID` / `VerifySELinuxMount` report host misconfiguration once during
+startup. `Runner.Hardened`
+creates a per-run internal network. Rootless podman gets a `harness-proxy`
+sidecar on that network, restricted to `Harness.EgressHosts()` and any extra
+hosts in `Runner.Sidecar`; other runtimes use `Runner.ProxyURL` through the
+network gateway. Runner images used for this path need curl and the
+`cmd/harness-proxy` binary. Call `SweepHardened` during startup to remove
+networks and sidecars left by an interrupted process.
 
 `egress` contains the authenticated allowlist proxy and
 `WriteSandboxSettings`, which writes Claude's `.claude/settings.json` domain

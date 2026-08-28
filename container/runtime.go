@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -64,28 +65,35 @@ func (rt Runtime) NeedsKeepID() bool {
 }
 
 // NeedsHardenedNetVerify reports whether a hardened run must prove its
-// per-run --internal network fail-closed before running. True for rootless
-// podman and for Apple's container runtime. Rootless podman's
+// per-run --internal network fail-closed before running. True for runtimes
+// that use a sidecar and for Apple's container runtime. Rootless podman's
 // pasta/slirp4netns host path is what varies across backends and what
 // --internal can sever. Apple's vmnet host-only network has the right
 // semantics (egress blocked, host reachable) but the implementation has known
 // rough edges, and this is a security boundary, so it is proven per run
 // rather than assumed. docker and rootful podman both run a bridge in the
-// host netns (gateway on the host), so they keep the trusted path and pay no
-// probe cost.
+// host netns (gateway on the host), so Linux docker and rootful podman keep the
+// trusted path and pay no probe cost.
 func (rt Runtime) NeedsHardenedNetVerify() bool {
-	return rt.Bin == runtimeApple || (rt.Bin == runtimePodman && rt.Rootless)
+	return rt.Bin == runtimeApple || rt.NeedsEgressSidecar()
 }
 
 // NeedsEgressSidecar reports whether hardened egress runs through a per-run
-// proxy sidecar rather than an in-process host proxy. True only for rootless
-// podman, where the host proxy is unreachable across the --internal boundary.
-// It is deliberately narrower than NeedsHardenedNetVerify (which also covers
-// Apple): Apple keeps the host proxy, reached via the per-run gateway, and
-// its CLI has neither `--network podman` nor `network connect`, so it must
-// not take the sidecar path even though it still needs the per-run --internal
-// verification.
+// proxy sidecar rather than an in-process host proxy. Rootless podman and
+// Docker Desktop cannot reach a host proxy across the --internal boundary.
+// Apple keeps the host proxy, reached through the per-run gateway.
 func (rt Runtime) NeedsEgressSidecar() bool {
+	return (rt.Bin == runtimePodman && rt.Rootless) || (rt.bin() == "docker" && runtime.GOOS != "linux")
+}
+
+func (rt Runtime) sidecarEgressNetwork() string {
+	if rt.bin() == "docker" {
+		return "bridge"
+	}
+	return "podman"
+}
+
+func (rt Runtime) needsInternalDNSDisabled() bool {
 	return rt.Bin == runtimePodman && rt.Rootless
 }
 
@@ -95,6 +103,13 @@ func (rt Runtime) NeedsEgressSidecar() bool {
 // address instead.
 func (rt Runtime) supportsHostGatewayAddHost() bool {
 	return rt.Bin != runtimeApple
+}
+
+func (rt Runtime) hostGatewayProbeNetwork(network string) string {
+	if rt.bin() == "docker" && runtime.GOOS != "linux" {
+		return ""
+	}
+	return network
 }
 
 // supportsPullNever reports whether `run --pull never` is supported. Apple's

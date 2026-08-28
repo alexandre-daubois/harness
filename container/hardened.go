@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 const (
 	hardenedNetworkPrefix = "harness-hardened-"
 	proxySidecarPrefix    = "harness-proxy-"
+	proxyOwnerPIDLabel    = "org.alpha-omega-security.harness.owner-pid"
 	proxySidecarPort      = "3128"
 	proxyReadyTimeout     = 30 * time.Second
 	proxyReadyPoll        = time.Second
@@ -35,9 +37,9 @@ const (
 	ProxyListenEnv    = "HARNESS_PROXY_LISTEN"
 )
 
-// SidecarConfig supplies the caller-specific parts of rootless podman's
-// egress proxy. Runner adds egress.HardenedAllow and Harness.EgressHosts to
-// Allow. Empty Token and GatewayIP values are generated and resolved per run.
+// SidecarConfig supplies the caller-specific parts of a hardened run's egress
+// proxy. Runner adds egress.HardenedAllow and Harness.EgressHosts to Allow.
+// Empty Token and GatewayIP values are generated and resolved per run.
 type SidecarConfig struct {
 	Image string // empty uses Runner.Image
 	Token string // empty generates a per-run token
@@ -74,9 +76,6 @@ func (r Runner) setupHardened(ctx context.Context, h harness.Harness) (hardenedR
 		return hardenedRun{}, fmt.Errorf("generate isolation key: %w", err)
 	}
 	network := hardenedNetworkPrefix + key
-	if err := ensureHardenedNetwork(ctx, r.Runtime, network); err != nil {
-		return hardenedRun{}, err
-	}
 	hn := hardenedRun{network: network}
 	failed := true
 	defer func() {
@@ -84,9 +83,12 @@ func (r Runner) setupHardened(ctx context.Context, h harness.Harness) (hardenedR
 			hn.cleanup(r.Runtime, nil)
 		}
 	}()
+	if err := ensureHardenedNetwork(ctx, r.Runtime, network); err != nil {
+		return hardenedRun{}, err
+	}
 
 	image := r.image()
-	hn.gatewayIP = ResolveHostGatewayIPv4(ctx, r.Runtime, image, network)
+	hn.gatewayIP = ResolveHostGatewayIPv4(ctx, r.Runtime, image, r.Runtime.hostGatewayProbeNetwork(network))
 	if r.Runtime.Bin == runtimeApple && hn.gatewayIP == "" {
 		return hardenedRun{}, fmt.Errorf("could not resolve the Apple network gateway for %q", network)
 	}
@@ -141,7 +143,7 @@ func ensureHardenedNetwork(ctx context.Context, rt Runtime, name string) error {
 
 func hardenedNetworkCreateArgs(rt Runtime, name string) []string {
 	args := []string{"network", "create", "--internal"}
-	if rt.NeedsEgressSidecar() {
+	if rt.needsInternalDNSDisabled() {
 		// Keep the internal resolver from shadowing DNS on the sidecar's
 		// default-network egress leg.
 		args = append(args, "--disable-dns")
@@ -212,13 +214,16 @@ func validateSidecarPorts(cfg SidecarConfig) error {
 
 func (r Runner) startProxySidecar(ctx context.Context, cfg SidecarConfig, name, network string) (string, error) {
 	removeContainer(r.Runtime, name)
-	if out, err := exec.CommandContext(ctx, r.Runtime.bin(), sidecarRunArgs(cfg, name, network)...).CombinedOutput(); err != nil {
+	cmd := exec.CommandContext(ctx, r.Runtime.bin(), sidecarRunArgs(cfg, name, network, os.Getpid())...)
+	cmd.Env, _ = overlayProcessEnv(os.Environ(), []string{ProxyTokenEnv + "=" + cfg.Token})
+	if out, err := cmd.CombinedOutput(); err != nil {
 		removeContainer(r.Runtime, name)
 		return "", fmt.Errorf("%s run proxy sidecar: %w: %s", r.Runtime.bin(), err, strings.TrimSpace(string(out)))
 	}
-	if out, err := exec.CommandContext(ctx, r.Runtime.bin(), "network", "connect", "--", "podman", name).CombinedOutput(); err != nil {
+	egressNetwork := r.Runtime.sidecarEgressNetwork()
+	if out, err := exec.CommandContext(ctx, r.Runtime.bin(), "network", "connect", "--", egressNetwork, name).CombinedOutput(); err != nil {
 		removeContainer(r.Runtime, name)
-		return "", fmt.Errorf("%s network connect podman: %w: %s", r.Runtime.bin(), err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("%s network connect %s: %w: %s", r.Runtime.bin(), egressNetwork, err, strings.TrimSpace(string(out)))
 	}
 	format := fmt.Sprintf(`{{(index .NetworkSettings.Networks %q).IPAddress}}`, network)
 	out, err := exec.CommandContext(ctx, r.Runtime.bin(), "inspect", "--format", format, "--", name).Output()
@@ -235,11 +240,12 @@ func (r Runner) startProxySidecar(ctx context.Context, cfg SidecarConfig, name, 
 	return net.JoinHostPort(ip, proxySidecarPort), nil
 }
 
-func sidecarRunArgs(cfg SidecarConfig, name, network string) []string {
+func sidecarRunArgs(cfg SidecarConfig, name, network string, ownerPID int) []string {
 	args := []string{
 		"run", "-d",
 		"--name", name,
 		"--network", network,
+		"--label", proxyOwnerPIDLabel + "=" + strconv.Itoa(ownerPID),
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
 		"--read-only",
@@ -248,7 +254,8 @@ func sidecarRunArgs(cfg SidecarConfig, name, network string) []string {
 	if cfg.GatewayIP != "" {
 		args = append(args, "--add-host", egress.HostGatewayAlias+":"+cfg.GatewayIP)
 	}
-	for _, env := range SidecarEnv(cfg, egress.ListenFirstIface+":"+proxySidecarPort) {
+	args = append(args, "-e", ProxyTokenEnv)
+	for _, env := range SidecarEnv(cfg, egress.ListenFirstIface+":"+proxySidecarPort)[1:] {
 		args = append(args, "-e", env)
 	}
 	return append(args, "--", cfg.Image, "harness-proxy")
@@ -519,11 +526,25 @@ func sweepProxySidecars(ctx context.Context, rt Runtime) (int, error) {
 	}
 	removed := 0
 	for _, name := range prefixedNames(out, proxySidecarPrefix) {
+		ownerPID, ok := sidecarOwnerPID(ctx, rt, name)
+		if !ok || processRunning(ownerPID) {
+			continue
+		}
 		if exec.CommandContext(ctx, rt.bin(), "rm", "-f", "--", name).Run() == nil {
 			removed++
 		}
 	}
 	return removed, nil
+}
+
+func sidecarOwnerPID(ctx context.Context, rt Runtime, name string) (int, bool) {
+	format := fmt.Sprintf(`{{index .Config.Labels %q}}`, proxyOwnerPIDLabel)
+	out, err := exec.CommandContext(ctx, rt.bin(), "inspect", "--format", format, "--", name).Output()
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	return pid, err == nil && pid > 0
 }
 
 func sweepNetworks(ctx context.Context, rt Runtime) (int, error) {

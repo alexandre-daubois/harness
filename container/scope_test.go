@@ -132,6 +132,9 @@ exit 0
 	if !strings.Contains(log, "-w /tmp") || strings.Count(log, "--network "+network) < 3 {
 		t.Errorf("scope commands did not share network and readiness workdir:\n%s", log)
 	}
+	if !strings.Contains(log, "--entrypoint sh -- img:latest -c provider-readiness") {
+		t.Errorf("readiness command did not override the image entrypoint:\n%s", log)
+	}
 	if len(events) != 1 || events[0].Kind != harness.KindEgress || !strings.Contains(events[0].Text, "blocked.test") {
 		t.Errorf("egress events = %+v", events)
 	}
@@ -152,7 +155,7 @@ func TestRunnerProcessEnvKeepsSecretOutOfArgv(t *testing.T) {
 	envPath := filepath.Join(dir, "env.log")
 	argsPath := filepath.Join(dir, "args.log")
 	script := `#!/bin/sh
-printf '%s' "$PROVIDER_TOKEN" > "$HARNESS_ENV_LOG"
+printf '%s\n%s' "$PROVIDER_TOKEN" "$HTTPS_PROXY" > "$HARNESS_ENV_LOG"
 printf '%s' "$*" > "$HARNESS_ARGS_LOG"
 `
 	if err := os.WriteFile(runtimePath, []byte(script), 0o755); err != nil {
@@ -166,6 +169,7 @@ printf '%s' "$*" > "$HARNESS_ARGS_LOG"
 		Image:      "img:latest",
 		Env:        []string{"PROVIDER_TOKEN"},
 		ProcessEnv: []string{"PROVIDER_TOKEN=scope-secret"},
+		ProxyURL:   "http://harness:proxy-secret@proxy.test:3128",
 	}
 	if err := runner.Run(t.Context(), stubHarness{}, harness.Job{Workspace: t.TempDir()}, nil); err != nil {
 		t.Fatal(err)
@@ -174,14 +178,14 @@ printf '%s' "$*" > "$HARNESS_ARGS_LOG"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(envBytes) != "scope-secret" {
+	if string(envBytes) != "scope-secret\nhttp://harness:proxy-secret@proxy.test:3128" {
 		t.Errorf("runtime process env = %q", envBytes)
 	}
 	argsBytes, err := os.ReadFile(argsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if args := string(argsBytes); !strings.Contains(args, "-e PROVIDER_TOKEN") || strings.Contains(args, "scope-secret") {
+	if args := string(argsBytes); !strings.Contains(args, "-e PROVIDER_TOKEN") || !strings.Contains(args, "-e HTTPS_PROXY") || strings.Contains(args, "scope-secret") || strings.Contains(args, "proxy-secret") {
 		t.Errorf("runtime args expose or omit provider token: %s", args)
 	}
 }
@@ -215,6 +219,9 @@ func TestScopeCommandReturnsRawFailureAndRunClassifiesAccountError(t *testing.T)
 	var accountErr *harness.AccountError
 	if errors.As(err, &accountErr) {
 		t.Fatalf("RunCommand classified account error: %v", err)
+	}
+	if message := err.Error(); !strings.Contains(message, runtimePath+" provider-readiness") || !strings.Contains(message, "credit balance is too low") {
+		t.Errorf("RunCommand error lacks runtime context: %v", err)
 	}
 	if got := string(out); !strings.Contains(got, "partial output") || !strings.Contains(got, "credit balance") {
 		t.Errorf("RunCommand output = %q", got)

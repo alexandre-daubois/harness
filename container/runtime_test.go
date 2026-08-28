@@ -2,6 +2,7 @@ package container
 
 import (
 	"errors"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -49,12 +50,13 @@ func TestRuntimeNeedsKeepID(t *testing.T) {
 }
 
 func TestRuntimeNeedsHardenedNetVerify(t *testing.T) {
+	wantDocker := runtime.GOOS != "linux"
 	tests := []struct {
 		rt   Runtime
 		want bool
 	}{
-		{Runtime{}, false},                             // docker (zero value)
-		{Runtime{Bin: "docker"}, false},                // docker explicit
+		{Runtime{}, wantDocker},                        // docker (zero value)
+		{Runtime{Bin: "docker"}, wantDocker},           // docker explicit
 		{Runtime{Bin: "podman"}, false},                // rootful podman -> trusted like docker
 		{Runtime{Bin: "podman", Rootless: true}, true}, // rootless podman -> verified
 		{Runtime{Bin: "apple"}, true},                  // apple --internal -> proven per run
@@ -66,18 +68,33 @@ func TestRuntimeNeedsHardenedNetVerify(t *testing.T) {
 	}
 }
 
+func TestRuntimeHostGatewayProbeNetwork(t *testing.T) {
+	wantDocker := "hardened"
+	if runtime.GOOS != "linux" {
+		wantDocker = ""
+	}
+	for _, tc := range []struct {
+		rt   Runtime
+		want string
+	}{
+		{Runtime{Bin: "docker"}, wantDocker},
+		{Runtime{Bin: "podman"}, "hardened"},
+		{Runtime{Bin: "apple"}, "hardened"},
+	} {
+		if got := tc.rt.hostGatewayProbeNetwork("hardened"); got != tc.want {
+			t.Errorf("%+v.hostGatewayProbeNetwork() = %q, want %q", tc.rt, got, tc.want)
+		}
+	}
+}
+
 func TestRuntimeNeedsEgressSidecar(t *testing.T) {
-	// The egress proxy sidecar is for rootless podman ONLY -- the one runtime
-	// where the host proxy is unreachable across the --internal boundary.
-	// Apple keeps the in-process host proxy (its CLI has no --network podman /
-	// network connect), and docker and rootful podman use the trusted
-	// host-netns bridge.
+	wantDocker := runtime.GOOS != "linux"
 	tests := []struct {
 		rt   Runtime
 		want bool
 	}{
-		{Runtime{}, false},                             // docker (zero value)
-		{Runtime{Bin: "docker"}, false},                // docker explicit
+		{Runtime{}, wantDocker},                        // docker (zero value)
+		{Runtime{Bin: "docker"}, wantDocker},           // docker explicit
 		{Runtime{Bin: "podman"}, false},                // rootful podman -> host proxy
 		{Runtime{Bin: "podman", Rootless: true}, true}, // rootless podman -> sidecar
 		{Runtime{Bin: "apple"}, false},                 // apple -> host proxy, NOT a sidecar
@@ -86,6 +103,12 @@ func TestRuntimeNeedsEgressSidecar(t *testing.T) {
 		if got := tc.rt.NeedsEgressSidecar(); got != tc.want {
 			t.Errorf("%+v.NeedsEgressSidecar() = %v, want %v", tc.rt, got, tc.want)
 		}
+	}
+	if got := (Runtime{Bin: "docker"}).sidecarEgressNetwork(); got != "bridge" {
+		t.Errorf("docker sidecar network = %q", got)
+	}
+	if got := (Runtime{Bin: "podman", Rootless: true}).sidecarEgressNetwork(); got != "podman" {
+		t.Errorf("podman sidecar network = %q", got)
 	}
 }
 

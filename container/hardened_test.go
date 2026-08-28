@@ -30,6 +30,9 @@ if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then
   exit 1
 fi
 if [ "$1" = "run" ]; then
+	if [ "$2" = "-d" ]; then
+		printf 'sidecar-token=%s\n' "$HARNESS_PROXY_TOKEN" >> "$HARNESS_RUNTIME_LOG"
+	fi
   case "$*" in
     *"--entrypoint grep"*) printf '%s\n' '192.0.2.1 hgw'; exit 0 ;;
     *"http://1.1.1.1"*) printf '%s\n' 'BLOCKED'; exit 0 ;;
@@ -92,7 +95,8 @@ exit 0
 		"-- img:latest harness-proxy",
 		"network connect -- podman",
 		"--network " + network,
-		"HTTPS_PROXY=http://harness:tok@10.89.1.2:3128",
+		"-e HTTPS_PROXY",
+		"sidecar-token=tok",
 		"--read-only",
 		"stub --headless",
 		"network rm -- " + network,
@@ -101,6 +105,9 @@ exit 0
 			t.Errorf("runtime log missing %q:\n%s", want, log)
 		}
 	}
+	if strings.Contains(log, "HTTPS_PROXY=http://harness:tok") || strings.Contains(log, ProxyTokenEnv+"=tok") {
+		t.Errorf("proxy token exposed in runtime args:\n%s", log)
+	}
 	if len(events) != 1 || events[0].Kind != harness.KindEgress || !strings.Contains(events[0].Text, "blocked.test") {
 		t.Errorf("egress events = %+v", events)
 	}
@@ -108,13 +115,14 @@ exit 0
 
 func TestRunnerRunHardenedValidation(t *testing.T) {
 	job := harness.Job{Workspace: t.TempDir()}
-	if err := (Runner{Hardened: true, Network: "existing"}).Run(t.Context(), stubHarness{}, job, nil); err == nil || !strings.Contains(err.Error(), "cannot both") {
+	runtime := Runtime{Bin: "podman"}
+	if err := (Runner{Runtime: runtime, Hardened: true, Network: "existing"}).Run(t.Context(), stubHarness{}, job, nil); err == nil || !strings.Contains(err.Error(), "cannot both") {
 		t.Errorf("Hardened plus Network error = %v", err)
 	}
-	if err := (Runner{Hardened: true}).Run(t.Context(), stubHarness{}, job, nil); err == nil || !strings.Contains(err.Error(), "ProxyURL is required") {
+	if err := (Runner{Runtime: runtime, Hardened: true}).Run(t.Context(), stubHarness{}, job, nil); err == nil || !strings.Contains(err.Error(), "ProxyURL is required") {
 		t.Errorf("missing ProxyURL error = %v", err)
 	}
-	if err := (Runner{Hardened: true, ProxyURL: "http://proxy"}).Run(t.Context(), stubHarness{}, job, nil); err == nil || !strings.Contains(err.Error(), "invalid ProxyURL") {
+	if err := (Runner{Runtime: runtime, Hardened: true, ProxyURL: "http://proxy"}).Run(t.Context(), stubHarness{}, job, nil); err == nil || !strings.Contains(err.Error(), "invalid ProxyURL") {
 		t.Errorf("invalid ProxyURL error = %v", err)
 	}
 }
@@ -151,15 +159,17 @@ func TestSidecarRunArgs(t *testing.T) {
 		HostPorts: []string{"11434"},
 		GatewayIP: "192.0.2.9",
 	}
-	args := sidecarRunArgs(cfg, "harness-proxy-a", "harness-hardened-a")
+	args := sidecarRunArgs(cfg, "harness-proxy-a", "harness-hardened-a", 1234)
 	for _, pair := range [][2]string{
 		{"--name", "harness-proxy-a"},
 		{"--network", "harness-hardened-a"},
+		{"--label", proxyOwnerPIDLabel + "=1234"},
 		{"--cap-drop", "ALL"},
 		{"--security-opt", "no-new-privileges"},
 		{"--add-host", egress.HostGatewayAlias + ":192.0.2.9"},
 		{"-e", ProxyListenEnv + "=" + egress.ListenFirstIface + ":3128"},
 		{"-e", ProxyHostPortsEnv + "=11434"},
+		{"-e", ProxyTokenEnv},
 	} {
 		if !hasAdjacent(args, pair[0], pair[1]) {
 			t.Errorf("missing %q %q in %v", pair[0], pair[1], args)
@@ -170,6 +180,39 @@ func TestSidecarRunArgs(t *testing.T) {
 	}
 	if tail := args[len(args)-3:]; !slices.Equal(tail, []string{"--", "proxy:latest", "harness-proxy"}) {
 		t.Errorf("sidecar tail = %v", tail)
+	}
+	if strings.Contains(strings.Join(args, " "), ProxyTokenEnv+"=tok") {
+		t.Errorf("sidecar args expose proxy token: %v", args)
+	}
+}
+
+func TestSetupHardenedCleansNetworkAfterCreateFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test runtime is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "runtime.log")
+	runtimePath := filepath.Join(dir, "runtime")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$HARNESS_RUNTIME_LOG"
+if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then exit 1; fi
+if [ "$1" = "network" ] && [ "$2" = "create" ]; then exit 7; fi
+exit 0
+`
+	if err := os.WriteFile(runtimePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HARNESS_RUNTIME_LOG", logPath)
+	runner := Runner{Runtime: Runtime{Bin: runtimePath}, Hardened: true, ProxyURL: "http://proxy.test:3128"}
+	if _, err := runner.Open(t.Context(), stubHarness{}); err == nil {
+		t.Fatal("Open error = nil")
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if log := string(logBytes); !strings.Contains(log, "network rm -- "+hardenedNetworkPrefix) {
+		t.Errorf("network cleanup missing after create failure:\n%s", log)
 	}
 }
 
@@ -249,7 +292,13 @@ func TestSweepHardened(t *testing.T) {
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$HARNESS_RUNTIME_LOG"
 if [ "$1" = "ps" ]; then
-  printf '%s\n' 'harness-proxy-a' 'my-harness-proxy-b' 'harness-proxy-c'
+	printf '%s\n' 'harness-proxy-a' 'my-harness-proxy-b' 'harness-proxy-c' 'harness-proxy-unknown'
+fi
+if [ "$1" = "inspect" ]; then
+	case "$*" in
+		*"harness-proxy-a"*) printf '%s\n' "$PPID" ;;
+		*"harness-proxy-c"*) printf '%s\n' '999999' ;;
+	esac
 fi
 if [ "$1" = "network" ] && [ "$2" = "ls" ]; then
   printf '%s\n' 'harness-hardened-a' 'my-harness-hardened-b' 'harness-hardened-c'
@@ -266,7 +315,7 @@ exit 0
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.ProxySidecars != 2 || result.Networks != 2 {
+	if result.ProxySidecars != 1 || result.Networks != 2 {
 		t.Errorf("result = %+v", result)
 	}
 	logBytes, err := os.ReadFile(logPath)
@@ -275,7 +324,6 @@ exit 0
 	}
 	log := string(logBytes)
 	for _, want := range []string{
-		"rm -f -- harness-proxy-a",
 		"rm -f -- harness-proxy-c",
 		"network rm -- harness-hardened-a",
 		"network rm -- harness-hardened-c",
@@ -283,6 +331,12 @@ exit 0
 		if !strings.Contains(log, want) {
 			t.Errorf("runtime log missing %q: %s", want, log)
 		}
+	}
+	if strings.Contains(log, "rm -f -- harness-proxy-a") {
+		t.Errorf("sweep removed a live process's sidecar: %s", log)
+	}
+	if strings.Contains(log, "rm -f -- harness-proxy-unknown") {
+		t.Errorf("sweep removed a sidecar without an owner label: %s", log)
 	}
 	if strings.Contains(log, "rm -f -- my-") || strings.Contains(log, "network rm -- my-") {
 		t.Errorf("sweep removed a substring-only match: %s", log)

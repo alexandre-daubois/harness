@@ -70,13 +70,13 @@ type Runner struct {
 	// paired with a proxy sidecar). Empty defers to ProxyURL.
 	Network string
 	// Hardened creates a private --internal network for Run or Open. Run removes
-	// it after its invocation; a Scope removes it on Close. Rootless podman also
-	// gets an egress proxy sidecar configured by Sidecar. Other runtimes reach
-	// the caller's ProxyURL through the network gateway. Hardened implies
-	// ReadOnly and cannot be combined with Network.
+	// it after its invocation; a Scope removes it on Close. Rootless podman and
+	// Docker Desktop get an egress proxy sidecar configured by Sidecar. Other
+	// runtimes reach the caller's ProxyURL through the network gateway. Hardened
+	// implies ReadOnly and cannot be combined with Network.
 	Hardened bool
-	// Sidecar configures rootless podman's per-run egress proxy. Other runtimes
-	// ignore it because they can reach ProxyURL across an internal network.
+	// Sidecar configures the per-run egress proxy used by rootless podman and
+	// Docker Desktop. Other runtimes reach ProxyURL across an internal network.
 	Sidecar SidecarConfig
 	// ReadOnly enables --read-only rootfs and (where supported)
 	// --security-opt no-new-privileges. WorkMount, StateMount, and /tmp stay
@@ -129,7 +129,7 @@ func (r Runner) args(h harness.Harness, j harness.Job, absWork string) []string 
 	return r.argsAt(h, j, absWork, WorkMount)
 }
 
-func (r Runner) argsAt(h harness.Harness, j harness.Job, absWork, workDir string) []string {
+func (r Runner) argsAt(h harness.Harness, j harness.Job, absWork, workDir string, entrypoint ...string) []string {
 	args := r.Runtime.runArgs(
 		"--rm",
 		"--cap-drop", "ALL",
@@ -197,13 +197,16 @@ func (r Runner) argsAt(h harness.Harness, j harness.Job, absWork, workDir string
 	}
 	if r.ProxyURL != "" {
 		args = append(args,
-			"-e", "HTTPS_PROXY="+r.ProxyURL,
-			"-e", "HTTP_PROXY="+r.ProxyURL,
-			"-e", "ALL_PROXY="+r.ProxyURL,
-			"-e", "NO_PROXY=",
+			"-e", "HTTPS_PROXY",
+			"-e", "HTTP_PROXY",
+			"-e", "ALL_PROXY",
+			"-e", "NO_PROXY",
 		)
 	} else if r.Network == "" {
 		args = append(args, "--network", "none")
+	}
+	if len(entrypoint) > 0 {
+		args = append(args, "--entrypoint", entrypoint[0])
 	}
 	image := r.Image
 	if image == "" {

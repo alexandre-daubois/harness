@@ -263,10 +263,11 @@ supplies scoped values for bare `Runner.Env` keys without exposing them in the
 container-runtime argv, while `Runner.OmitEnv` removes inherited backend
 credentials that a caller replaces. Rootless podman gets a `harness-proxy`
 sidecar on that network, restricted to `Harness.EgressHosts()` and any extra
-hosts in `Runner.Sidecar`; other runtimes use `Runner.ProxyURL` through the
-network gateway. Runner images used for this path need curl and the
-`cmd/harness-proxy` binary. Call `SweepHardened` during startup to remove
-networks and sidecars left by an interrupted process.
+hosts in `Runner.Sidecar`; Docker Desktop uses the same sidecar because an
+internal network cannot reach its host proxy. Other runtimes use
+`Runner.ProxyURL` through the network gateway. Runner images used for this
+path need curl and the `cmd/harness-proxy` binary. Call `SweepHardened` during
+startup to remove networks and sidecars left by an interrupted process.
 
 `egress` contains the authenticated allowlist proxy and
 `WriteSandboxSettings`, which writes Claude's `.claude/settings.json` domain

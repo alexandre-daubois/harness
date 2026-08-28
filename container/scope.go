@@ -54,6 +54,7 @@ func (r Runner) Open(ctx context.Context, h harness.Harness) (*Scope, error) {
 	}
 	scope := &Scope{runner: r, harness: h, processEnv: processEnv}
 	if !r.Hardened {
+		scope.setProxyProcessEnv()
 		return scope, nil
 	}
 	if r.Network != "" {
@@ -74,7 +75,20 @@ func (r Runner) Open(ctx context.Context, h harness.Harness) (*Scope, error) {
 	case r.Runtime.Bin == runtimeApple:
 		scope.runner.ProxyURL = proxyURLWithHost(r.ProxyURL, hardened.gatewayIP)
 	}
+	scope.setProxyProcessEnv()
 	return scope, nil
+}
+
+func (s *Scope) setProxyProcessEnv() {
+	if s.runner.ProxyURL == "" {
+		return
+	}
+	s.processEnv, _ = overlayProcessEnv(s.processEnv, []string{
+		"HTTPS_PROXY=" + s.runner.ProxyURL,
+		"HTTP_PROXY=" + s.runner.ProxyURL,
+		"ALL_PROXY=" + s.runner.ProxyURL,
+		"NO_PROXY=",
+	})
 }
 
 // Run starts the scope's backend inside an ephemeral container and streams its
@@ -152,14 +166,21 @@ func (s *Scope) RunCommand(ctx context.Context, j harness.Job, command Command) 
 	}
 	cj := j
 	cj.Workspace = WorkMount
-	args := s.runner.argsAt(s.harness, cj, absWork, workDir)
-	args = append(args, command.Args...)
+	args := s.runner.argsAt(s.harness, cj, absWork, workDir, command.Args[0])
+	args = append(args, command.Args[1:]...)
 
 	cmd := exec.CommandContext(ctx, s.runner.Runtime.bin(), args...)
 	cmd.Env = s.processEnv
 	var output bytes.Buffer
-	_, err = harness.StreamCmd(cmd, commandHarness{Harness: s.harness, output: &output}, nil)
-	return output.Bytes(), err
+	stderr, err := harness.StreamCmd(cmd, commandHarness{Harness: s.harness, output: &output}, nil)
+	if err == nil {
+		return output.Bytes(), nil
+	}
+	wrapped := fmt.Errorf("container: %s %s: %w", s.runner.Runtime.bin(), command.Args[0], err)
+	if tail := tailStderr(stderr); tail != "" {
+		wrapped = fmt.Errorf("%w: %s", wrapped, tail)
+	}
+	return output.Bytes(), wrapped
 }
 
 // Close emits proxy decisions and removes the scope's sidecar and network.

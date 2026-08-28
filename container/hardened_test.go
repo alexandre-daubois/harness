@@ -2,12 +2,15 @@ package container
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alpha-omega-security/harness"
 	"github.com/alpha-omega-security/harness/egress"
@@ -124,6 +127,67 @@ func TestRunnerRunHardenedValidation(t *testing.T) {
 	}
 	if err := (Runner{Runtime: runtime, Hardened: true, ProxyURL: "http://proxy"}).Run(t.Context(), stubHarness{}, job, nil); err == nil || !strings.Contains(err.Error(), "invalid ProxyURL") {
 		t.Errorf("invalid ProxyURL error = %v", err)
+	}
+}
+
+func TestRunnerOpenPreservesCancellationDuringSidecarReadiness(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test runtime is a POSIX shell script")
+	}
+	binDir := t.TempDir()
+	reachStarted := filepath.Join(t.TempDir(), "reach-started")
+	runtimePath := filepath.Join(binDir, "podman")
+	script := `#!/bin/sh
+if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then
+  exit 1
+fi
+if [ "$1" = "run" ]; then
+  case "$*" in
+    *"--entrypoint grep"*) printf '%s\n' '192.0.2.1 hgw'; exit 0 ;;
+    *"http://1.1.1.1"*) printf '%s\n' 'BLOCKED'; exit 0 ;;
+    *"http://10.89.1.2:3128/"*) : > "$HARNESS_REACH_STARTED"; while :; do :; done ;;
+  esac
+fi
+if [ "$1" = "inspect" ]; then
+  printf '%s\n' '10.89.1.2'
+fi
+exit 0
+`
+	if err := os.WriteFile(runtimePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HARNESS_REACH_STARTED", reachStarted)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		scope, err := (Runner{
+			Runtime:  Runtime{Bin: "podman", Rootless: true},
+			Image:    "img:latest",
+			Hardened: true,
+			Sidecar:  SidecarConfig{Token: "tok"},
+		}).Open(ctx, hardenedStubHarness{})
+		if scope != nil {
+			scope.Close(nil)
+		}
+		errCh <- err
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(reachStarted); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("sidecar reachability probe did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Errorf("Open error = %v, want context.Canceled", err)
 	}
 }
 
@@ -281,6 +345,22 @@ func TestHardenedHelpers(t *testing.T) {
 	if !slices.Equal(got, []string{"harness-hardened-a", "harness-hardened-c"}) {
 		t.Errorf("prefixedNames = %v", got)
 	}
+	key, err := hardenedKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid, ok := hardenedNetworkOwnerPID(hardenedNetworkPrefix + key); !ok || pid != os.Getpid() {
+		t.Errorf("hardened network owner = %d, %v", pid, ok)
+	}
+	for _, name := range []string{
+		"harness-hardened-a",
+		"harness-hardened-1234-short",
+		"harness-hardened-1234-zzzzzzzzzzzzzzzz",
+	} {
+		if pid, ok := hardenedNetworkOwnerPID(name); ok {
+			t.Errorf("hardenedNetworkOwnerPID(%q) = %d, true", name, pid)
+		}
+	}
 }
 
 func TestSweepHardened(t *testing.T) {
@@ -301,7 +381,8 @@ if [ "$1" = "inspect" ]; then
 	esac
 fi
 if [ "$1" = "network" ] && [ "$2" = "ls" ]; then
-  printf '%s\n' 'harness-hardened-a' 'my-harness-hardened-b' 'harness-hardened-c'
+  printf 'harness-hardened-%s-0123456789abcdef\n' "$PPID"
+  printf '%s\n' 'my-harness-hardened-b' 'harness-hardened-99999999-fedcba9876543210' 'harness-hardened-legacy'
 fi
 exit 0
 `
@@ -315,7 +396,7 @@ exit 0
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.ProxySidecars != 1 || result.Networks != 2 {
+	if result.ProxySidecars != 1 || result.Networks != 1 {
 		t.Errorf("result = %+v", result)
 	}
 	logBytes, err := os.ReadFile(logPath)
@@ -325,8 +406,7 @@ exit 0
 	log := string(logBytes)
 	for _, want := range []string{
 		"rm -f -- harness-proxy-c",
-		"network rm -- harness-hardened-a",
-		"network rm -- harness-hardened-c",
+		"network rm -- harness-hardened-99999999-fedcba9876543210",
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("runtime log missing %q: %s", want, log)
@@ -338,7 +418,74 @@ exit 0
 	if strings.Contains(log, "rm -f -- harness-proxy-unknown") {
 		t.Errorf("sweep removed a sidecar without an owner label: %s", log)
 	}
+	if strings.Contains(log, "network rm -- harness-hardened-legacy") || strings.Contains(log, "network rm -- harness-hardened-"+strconv.Itoa(os.Getpid())+"-") {
+		t.Errorf("sweep removed a network without a dead owner: %s", log)
+	}
 	if strings.Contains(log, "rm -f -- my-") || strings.Contains(log, "network rm -- my-") {
 		t.Errorf("sweep removed a substring-only match: %s", log)
+	}
+}
+
+func TestSweepHardenedKeepsActiveScopeNetwork(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test runtime is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "runtime.log")
+	namePath := filepath.Join(dir, "network-name")
+	runtimePath := filepath.Join(dir, "runtime")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$HARNESS_RUNTIME_LOG"
+if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then
+  exit 1
+fi
+if [ "$1" = "network" ] && [ "$2" = "create" ]; then
+  for arg do name="$arg"; done
+  printf '%s\n' "$name" > "$HARNESS_NETWORK_NAME"
+fi
+if [ "$1" = "network" ] && [ "$2" = "ls" ]; then
+  cat "$HARNESS_NETWORK_NAME"
+fi
+if [ "$1" = "run" ]; then
+  case "$*" in
+    *"--entrypoint grep"*) printf '%s\n' '192.0.2.1 hgw' ;;
+    *) printf '%s\n' 'ready' ;;
+  esac
+fi
+exit 0
+`
+	if err := os.WriteFile(runtimePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HARNESS_RUNTIME_LOG", logPath)
+	t.Setenv("HARNESS_NETWORK_NAME", namePath)
+
+	runner := Runner{
+		Runtime:  Runtime{Bin: runtimePath},
+		Image:    "img:latest",
+		Hardened: true,
+		ProxyURL: "http://proxy.test:3128",
+	}
+	scope, err := runner.Open(t.Context(), stubHarness{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { scope.Close(nil) })
+	result, err := SweepHardened(t.Context(), runner.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Networks != 0 {
+		t.Fatalf("sweep result = %+v", result)
+	}
+	if _, err := scope.RunCommand(t.Context(), harness.Job{Workspace: t.TempDir()}, Command{Args: []string{"true"}}); err != nil {
+		t.Fatalf("RunCommand after sweep: %v", err)
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logBytes), "network rm --") {
+		t.Errorf("sweep removed the active scope network:\n%s", logBytes)
 	}
 }

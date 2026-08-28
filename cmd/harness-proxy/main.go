@@ -15,7 +15,10 @@ import (
 	"github.com/alpha-omega-security/harness/egress"
 )
 
-const readinessTimeout = 20 * time.Second
+const (
+	readinessTimeout = 20 * time.Second
+	readinessPoll    = 250 * time.Millisecond
+)
 
 type proxyConfig struct {
 	listen    string
@@ -113,7 +116,7 @@ func runProxy(args []string) error {
 			return fmt.Errorf("egress proxy refusing to start: %w", err)
 		}
 	}
-	if err := egress.VerifyUpstreamDNS(ctx, cfg.allow); err != nil {
+	if err := waitUpstreamDNS(ctx, cfg.allow, egress.VerifyUpstreamDNS, readinessPoll); err != nil {
 		return fmt.Errorf("egress proxy refusing to start: %w", err)
 	}
 
@@ -128,4 +131,22 @@ func runProxy(args []string) error {
 	}
 	log.Info("egress proxy listening", "addr", cfg.listen, "allow", len(cfg.allow))
 	return egress.Serve(proxy, cfg.listen)
+}
+
+func waitUpstreamDNS(ctx context.Context, allow []string, verify func(context.Context, []string) error, poll time.Duration) error {
+	var lastErr error
+	for {
+		if err := verify(ctx, allow); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		timer := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("%w: %v", ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+	}
 }

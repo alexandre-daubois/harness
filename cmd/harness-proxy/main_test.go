@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alpha-omega-security/harness/container"
 	"github.com/alpha-omega-security/harness/egress"
@@ -59,5 +61,33 @@ func TestResolveListen(t *testing.T) {
 	got, err = resolveListen("127.0.0.1:3128", func() (string, error) { return "", errors.New("must not run") })
 	if err != nil || got != "127.0.0.1:3128" {
 		t.Errorf("explicit listen = %q, %v", got, err)
+	}
+}
+
+func TestWaitUpstreamDNSRetries(t *testing.T) {
+	attempts := 0
+	err := waitUpstreamDNS(t.Context(), []string{"api.example.test"}, func(context.Context, []string) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("egress network is not attached")
+		}
+		return nil
+	}, time.Nanosecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestWaitUpstreamDNSPreservesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	err := waitUpstreamDNS(ctx, []string{"api.example.test"}, func(context.Context, []string) error {
+		cancel()
+		return errors.New("resolver unavailable")
+	}, time.Hour)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
 	}
 }

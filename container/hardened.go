@@ -127,7 +127,7 @@ func hardenedKey() (string, error) {
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(b[:]), nil
+	return strconv.Itoa(os.Getpid()) + "-" + hex.EncodeToString(b[:]), nil
 }
 
 func ensureHardenedNetwork(ctx context.Context, rt Runtime, name string) error {
@@ -322,7 +322,13 @@ func (r Runner) verifySidecarReachable(ctx context.Context, hn hardenedRun, imag
 		if err == nil && strings.Contains(last, "REACHED") {
 			return nil
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if !sidecarRunning(ctx, r.Runtime, hn.proxyName) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			return fmt.Errorf("proxy sidecar %q exited before becoming reachable; logs: %s", hn.proxyName, sidecarLogTail(r.Runtime, hn.proxyName))
 		}
 		select {
@@ -506,7 +512,8 @@ type SweepResult struct {
 	Networks      int
 }
 
-// SweepHardened removes stale sidecars first, then unpinned hardened networks.
+// SweepHardened removes stale sidecars first, then hardened networks whose
+// owning process is no longer running.
 func SweepHardened(ctx context.Context, rt Runtime) (SweepResult, error) {
 	var result SweepResult
 	var sidecarErr error
@@ -558,11 +565,31 @@ func sweepNetworks(ctx context.Context, rt Runtime) (int, error) {
 	}
 	removed := 0
 	for _, name := range prefixedNames(out, hardenedNetworkPrefix) {
+		ownerPID, ok := hardenedNetworkOwnerPID(name)
+		if !ok || processRunning(ownerPID) {
+			continue
+		}
 		if exec.CommandContext(ctx, rt.bin(), "network", "rm", "--", name).Run() == nil {
 			removed++
 		}
 	}
 	return removed, nil
+}
+
+func hardenedNetworkOwnerPID(name string) (int, bool) {
+	rest, ok := strings.CutPrefix(name, hardenedNetworkPrefix)
+	if !ok {
+		return 0, false
+	}
+	pidText, key, ok := strings.Cut(rest, "-")
+	if !ok || len(key) != 16 {
+		return 0, false
+	}
+	if _, err := hex.DecodeString(key); err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(pidText)
+	return pid, err == nil && pid > 0
 }
 
 func prefixedNames(out []byte, prefix string) []string {

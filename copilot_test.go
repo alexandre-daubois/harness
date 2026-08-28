@@ -14,6 +14,7 @@ func TestCopilotArgs(t *testing.T) {
 	args := CopilotHarness{}.Args(Job{
 		Prompt:          "Check it.",
 		Model:           "claude-sonnet-4.6",
+		Effort:          "high",
 		MaxTurns:        7,
 		ResumeSessionID: "session-1",
 		ResumePrompt:    "Check it.",
@@ -27,7 +28,10 @@ func TestCopilotArgs(t *testing.T) {
 		"7",
 		"--allow-all",
 		"--no-ask-user",
+		"--no-remote-export",
 		"claude-sonnet-4.6",
+		"--effort",
+		"high",
 		"--resume=session-1",
 	} {
 		if !slices.Contains(args, want) {
@@ -136,5 +140,47 @@ func TestCopilotStreamAccumulatesOneTerminalResult(t *testing.T) {
 	wantCost := CostFromUsage("claude-sonnet-4.6", wantUsage)
 	if math.Abs(result.CostUSD-wantCost) > 1e-12 {
 		t.Errorf("cost = %.12f, want %.12f", result.CostUSD, wantCost)
+	}
+}
+
+func TestCopilotStreamUsesLatestUsageCheckpointCost(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.usage","data":{"model":"claude-sonnet-4.6","inputTokens":1000000,"outputTokens":1000000}}`,
+		`{"type":"assistant.turn_end","data":{"turnId":"0"}}`,
+		`{"type":"session.usage_checkpoint","data":{"totalNanoAiu":7313250000,"totalPremiumRequests":1}}`,
+		`{"type":"assistant.turn_end","data":{"turnId":"1"}}`,
+		`{"type":"session.usage_checkpoint","data":{"totalNanoAiu":8148135000,"totalPremiumRequests":1}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var events []Event
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		events = append(events, event)
+	})
+	if len(events) != 2 {
+		t.Fatalf("events = %+v, want session and result", events)
+	}
+	result := events[1]
+	if result.Turns != 2 || result.Usage.InputTokens != 1000000 {
+		t.Errorf("result = %+v", result)
+	}
+	const wantCostUSD = 0.08148135
+	if math.Abs(result.CostUSD-wantCostUSD) > 1e-12 {
+		t.Errorf("cost = %.12f, want checkpoint %.12f", result.CostUSD, wantCostUSD)
+	}
+}
+
+func TestCopilotStreamRequiresTerminalEnvelope(t *testing.T) {
+	t.Parallel()
+
+	stream := `{"type":"assistant.usage","data":{"model":"claude-sonnet-4.6","inputTokens":100}}`
+	var events []Event
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		events = append(events, event)
+	})
+	if len(events) != 0 {
+		t.Fatalf("events = %+v, want none without a result envelope", events)
 	}
 }

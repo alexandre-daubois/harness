@@ -10,7 +10,8 @@ import (
 )
 
 // CopilotHarness drives GitHub Copilot CLI in non-interactive prompt mode.
-// Its arguments and JSONL mapping are based on Copilot CLI 1.0.75.
+// Its arguments and JSONL mapping target Copilot CLI 1.0.80 while retaining
+// compatibility with the prompt-mode stream introduced in 1.0.75.
 type CopilotHarness struct{}
 
 func (CopilotHarness) Binary() string { return "copilot" }
@@ -32,9 +33,13 @@ func (CopilotHarness) Args(j Job) []string {
 		"--no-ask-user",
 		"--no-auto-update",
 		"--no-color",
+		"--no-remote-export",
 	}
 	if j.Model != "" {
 		args = append(args, "--model", j.Model)
+	}
+	if j.Effort != "" {
+		args = append(args, "--effort", j.Effort)
 	}
 	if id := safeSessionID(j.ResumeSessionID); id != "" {
 		args = append(args, "--resume="+id)
@@ -46,32 +51,20 @@ func (CopilotHarness) Prompt(j Job) string {
 	return explicitSkillPrompt(j, "./.github/skills/"+j.SkillName)
 }
 
-// ParseStream combines per-call assistant.usage and per-turn
-// assistant.turn_end records into one result emitted after the stream ends.
-// This gives callers the same single-run totals exposed by the other backends
-// and prevents consumers that retain only the last result from losing usage.
+// ParseStream combines per-call token usage and cumulative billing checkpoints
+// into one result emitted after Copilot's final envelope. This gives callers
+// the same single-run totals exposed by the other backends.
 func (CopilotHarness) ParseStream(r io.Reader, emit func(Event)) {
-	total := Event{Kind: KindResult}
-	sawResult := false
-	scanJSONL(r, func(event Event) {
-		if event.Kind != KindResult {
-			emit(event)
-			return
-		}
-		sawResult = true
-		total.CostUSD += event.CostUSD
-		total.Turns += event.Turns
-		total.Usage.InputTokens += event.Usage.InputTokens
-		total.Usage.OutputTokens += event.Usage.OutputTokens
-		total.Usage.CacheReadTokens += event.Usage.CacheReadTokens
-		total.Usage.CacheWriteTokens += event.Usage.CacheWriteTokens
-		if event.Text != "" {
-			total.Text = event.Text
-		}
-	}, parseCopilotLine)
-	if sawResult {
-		emit(total)
+	state := copilotStreamState{result: Event{Kind: KindResult}}
+	scanJSONL(r, emit, state.parseLine)
+	if !state.sawTerminal {
+		return
 	}
+	state.result.CostUSD = state.estimatedCostUSD
+	if state.sawCheckpoint {
+		state.result.CostUSD = state.checkpointCostUSD
+	}
+	emit(state.result)
 }
 
 // copilotLine contains the shared envelope fields used by prompt-mode JSONL.
@@ -81,6 +74,15 @@ type copilotLine struct {
 	Data      json.RawMessage `json:"data"`
 	SessionID string          `json:"sessionId"`
 	ExitCode  *int            `json:"exitCode"`
+}
+
+// copilotStreamState accumulates the terminal result across the JSONL stream.
+type copilotStreamState struct {
+	result            Event
+	estimatedCostUSD  float64
+	checkpointCostUSD float64
+	sawCheckpoint     bool
+	sawTerminal       bool
 }
 
 type copilotMessageData struct {
@@ -105,12 +107,16 @@ type copilotUsageData struct {
 	CacheWriteTokens int    `json:"cacheWriteTokens"`
 }
 
+type copilotUsageCheckpointData struct {
+	TotalNanoAIU *float64 `json:"totalNanoAiu"`
+}
+
 type copilotErrorData struct {
 	Message string `json:"message"`
 	Error   string `json:"error"`
 }
 
-func parseCopilotLine(raw []byte, emit func(Event)) {
+func (state *copilotStreamState) parseLine(raw []byte, emit func(Event)) {
 	line := strings.TrimSpace(string(raw))
 	if line == "" {
 		return
@@ -140,32 +146,26 @@ func parseCopilotLine(raw []byte, emit func(Event)) {
 	case "assistant.usage":
 		var data copilotUsageData
 		if json.Unmarshal(event.Data, &data) == nil {
-			usage := Usage{
-				InputTokens:      data.InputTokens,
-				OutputTokens:     data.OutputTokens,
-				CacheReadTokens:  data.CacheReadTokens,
-				CacheWriteTokens: data.CacheWriteTokens,
-			}
-			emit(Event{
-				Kind:    KindResult,
-				CostUSD: CostFromUsage(data.Model, usage),
-				Usage:   usage,
-			})
+			state.addUsage(data)
+		}
+	case "session.usage_checkpoint":
+		var data copilotUsageCheckpointData
+		if json.Unmarshal(event.Data, &data) == nil && data.TotalNanoAIU != nil {
+			// Checkpoints are cumulative for the session, so the latest value
+			// replaces earlier values and any token-based estimate.
+			state.checkpointCostUSD = copilotNanoAIUCostUSD(*data.TotalNanoAIU)
+			state.sawCheckpoint = true
 		}
 	case "assistant.turn_end":
-		// Copilot reports turns separately from token usage. ParseStream merges
-		// both records into one result after all turns finish.
-		emit(Event{Kind: KindResult, Turns: 1})
+		state.result.Turns++
 	case "result":
+		state.sawTerminal = true
 		if event.SessionID != "" {
 			emit(Event{Kind: KindSession, SessionID: event.SessionID})
 		}
 		if event.ExitCode != nil && *event.ExitCode != 0 {
 			emit(Event{Kind: KindError, Text: fmt.Sprintf("copilot exited with code %d", *event.ExitCode)})
 		}
-		// The final envelope guarantees a terminal result even if a failed or
-		// empty run produced no usage and no completed turn.
-		emit(Event{Kind: KindResult})
 	case "abort", "session.error", "error":
 		emitCopilotError(event.Data, line, emit)
 	case "assistant.message_delta",
@@ -180,12 +180,36 @@ func parseCopilotLine(raw []byte, emit func(Event)) {
 		"session.mcp_servers_loaded",
 		"session.skills_loaded",
 		"session.tools_updated",
-		"session.usage_checkpoint",
 		"session.usage_info",
 		"user.message":
 	default:
 		emit(Event{Kind: KindText, Text: line})
 	}
+}
+
+func (state *copilotStreamState) addUsage(data copilotUsageData) {
+	usage := Usage{
+		InputTokens:      data.InputTokens,
+		OutputTokens:     data.OutputTokens,
+		CacheReadTokens:  data.CacheReadTokens,
+		CacheWriteTokens: data.CacheWriteTokens,
+	}
+	state.estimatedCostUSD += CostFromUsage(data.Model, usage)
+	state.result.Usage.InputTokens += usage.InputTokens
+	state.result.Usage.OutputTokens += usage.OutputTokens
+	state.result.Usage.CacheReadTokens += usage.CacheReadTokens
+	state.result.Usage.CacheWriteTokens += usage.CacheWriteTokens
+}
+
+const (
+	nanoAIUPerAICredit = 1e9
+	usdPerAICredit     = 0.01
+)
+
+// copilotNanoAIUCostUSD converts Copilot's billing unit to USD. One AI credit
+// is $0.01 and nano-AIU uses the SI nano scale.
+func copilotNanoAIUCostUSD(totalNanoAIU float64) float64 {
+	return totalNanoAIU / nanoAIUPerAICredit * usdPerAICredit
 }
 
 func emitCopilotMessage(raw json.RawMessage, emit func(Event)) {
@@ -274,14 +298,34 @@ func (CopilotHarness) StateEnv(dir string) []string {
 }
 
 func (CopilotHarness) DefaultModels() []ModelDefault {
-	// These IDs are accepted by Copilot CLI 1.0.75. Dotted Anthropic IDs are
-	// distinct from Claude Code's hyphenated provider IDs.
+	// This is Copilot CLI 1.0.80's /model --list --json catalog. The reported
+	// current model, GPT-5.6 Sol, is moved first because callers treat the first
+	// entry as the default. Dotted Anthropic IDs are distinct from Claude Code's
+	// hyphenated IDs.
 	return []ModelDefault{
-		{Name: "Claude Sonnet 4.6", ID: "claude-sonnet-4.6", Tier: "high"},
-		{Name: "Claude Haiku 4.5", ID: "claude-haiku-4.5", Tier: "mid"},
-		{Name: "Claude Opus 4.6", ID: "claude-opus-4.6", Tier: "max"},
-		{Name: "GPT-5.3 Codex", ID: "gpt-5.3-codex"},
+		{Name: "GPT-5.6 Sol", ID: "gpt-5.6-sol"},
+		{Name: "Claude Sonnet 5", ID: "claude-sonnet-5"},
+		{Name: "Claude Opus 5", ID: "claude-opus-5", Tier: "max"},
+		{Name: "Claude Opus 4.8", ID: "claude-opus-4.8"},
+		{Name: "Claude Opus 4.7", ID: "claude-opus-4.7"},
+		{Name: "Claude Sonnet 4.6", ID: "claude-sonnet-4.6", Tier: "mid"},
+		{Name: "Claude Opus 4.6", ID: "claude-opus-4.6", Tier: "high"},
+		{Name: "Claude Haiku 4.5", ID: "claude-haiku-4.5"},
+		{Name: "GPT-5.6 Terra", ID: "gpt-5.6-terra"},
+		{Name: "GPT-5.6 Luna", ID: "gpt-5.6-luna"},
+		{Name: "GPT-5.5", ID: "gpt-5.5"},
 		{Name: "GPT-5.4", ID: "gpt-5.4"},
+		{Name: "GPT-5.4 mini", ID: "gpt-5.4-mini"},
+		{Name: "GPT-5.3-Codex", ID: "gpt-5.3-codex"},
+		{Name: "GPT-5 mini", ID: "gpt-5-mini"},
+		{Name: "MAI-Code-1-Flash", ID: "mai-code-1-flash-picker"},
+		{Name: "Gemini 3.7 Flash", ID: "gemini-3.7-flash"},
+		{Name: "Gemini 3.6 Flash", ID: "gemini-3.6-flash"},
+		{Name: "Gemini 3.5 Flash", ID: "gemini-3.5-flash"},
+		{Name: "Gemini 3.1 Pro Preview", ID: "gemini-3.1-pro-preview"},
+		{Name: "Grok 4.5", ID: "grok-4.5"},
+		{Name: "Grok 4.6", ID: "grok-4.6"},
+		{Name: "MAI-Code-1.1-Flash", ID: "mai-code-1.1-flash"},
 	}
 }
 

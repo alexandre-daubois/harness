@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCopilotArgs(t *testing.T) {
@@ -265,6 +266,51 @@ func TestCopilotStreamFiltersSubagentConversation(t *testing.T) {
 	}
 	if result.Usage.InputTokens != 50 || result.Usage.OutputTokens != 5 {
 		t.Errorf("subagent usage was not retained: %+v", result.Usage)
+	}
+}
+
+func TestCopilotStreamQuotaRateLimits(t *testing.T) {
+	t.Parallel()
+
+	stream := strings.Join([]string{
+		`{"type":"assistant.usage","data":{"model":"gpt-5.6-sol","inputTokens":10,"quotaSnapshots":{` +
+			`"premium":{"hasQuota":false,"resetDate":"2026-09-01T00:00:00Z"},` +
+			`"unlimited":{"hasQuota":false,"isUnlimitedEntitlement":true},` +
+			`"paid":{"hasQuota":false,"overage":3,"overageAllowedWithExhaustedQuota":true},` +
+			`"inferred":{"remainingPercentage":0,"usageAllowedWithExhaustedQuota":true},` +
+			`"available":{"hasQuota":true}}}}`,
+		`{"type":"result","sessionId":"session-1","exitCode":0}`,
+	}, "\n")
+
+	var limits []*RateLimitInfo
+	CopilotHarness{}.ParseStream(strings.NewReader(stream), func(event Event) {
+		if event.Kind == KindRateLimit {
+			limits = append(limits, event.RateLimit)
+		}
+	})
+	if len(limits) != 3 {
+		t.Fatalf("rate limits = %+v, want three exhausted snapshots", limits)
+	}
+	byType := make(map[string]*RateLimitInfo)
+	for _, limit := range limits {
+		byType[limit.Type] = limit
+	}
+	premium := byType["premium"]
+	if premium == nil || !premium.Rejected() {
+		t.Fatalf("premium limit = %+v, want rejected", premium)
+	}
+	wantReset := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	if premium.ResetTime() == nil || !premium.ResetTime().Equal(wantReset) {
+		t.Errorf("premium reset = %v, want %v", premium.ResetTime(), wantReset)
+	}
+	if paid := byType["paid"]; paid == nil || paid.Status != "allowed" || !paid.IsUsingOverage {
+		t.Errorf("paid limit = %+v, want allowed overage", paid)
+	}
+	if inferred := byType["inferred"]; inferred == nil || inferred.Status != "allowed" {
+		t.Errorf("inferred limit = %+v, want allowed", inferred)
+	}
+	if _, ok := byType["unlimited"]; ok {
+		t.Errorf("unlimited entitlement should not be reported as exhausted")
 	}
 }
 

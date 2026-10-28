@@ -2,6 +2,9 @@ package container
 
 import (
 	"context"
+	"path"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/alpha-omega-security/harness"
@@ -75,13 +78,36 @@ type Runner struct {
 	// runtimes reach the caller's ProxyURL through the network gateway. Hardened
 	// implies ReadOnly and cannot be combined with Network.
 	Hardened bool
-	// Sidecar configures the per-run egress proxy used by rootless podman and
-	// Docker Desktop. Other runtimes reach ProxyURL across an internal network.
+	// IsolateHost makes Hardened create its network with both gateway modes
+	// isolated and IPv6 disabled, always run the egress proxy sidecar, and
+	// alias host.docker.internal to that sidecar, so the backend reaches no
+	// host service except through it. It requires Hardened and Docker Engine
+	// 28 or newer, and Open fails on other runtimes and on older or unknown
+	// engine versions.
+	IsolateHost bool
+	// Sidecar configures the per-run egress proxy used by rootless podman,
+	// Docker Desktop, and IsolateHost. Other runtimes reach ProxyURL across an
+	// internal network.
 	Sidecar SidecarConfig
 	// ReadOnly enables --read-only rootfs and (where supported)
 	// --security-opt no-new-privileges. WorkMount, StateMount, and /tmp stay
 	// writable.
 	ReadOnly bool
+	// ReadOnlyWorkspace mounts the workspace read-only except for
+	// Job.OutputFile, which must stay inside it. Run empties that file on the
+	// host before each backend invocation and RunCommand creates it when
+	// missing, then both bind-mount it writable. Apple's container runtime is
+	// rejected.
+	ReadOnlyWorkspace bool
+	// Memory and CPUs are passed to --memory and --cpus as given, such as "2g"
+	// and "2". PIDsLimit is passed to --pids-limit. FileSizeLimit is the
+	// largest file in bytes the container may write, set as the fsize ulimit.
+	// Zero values add no flag. Apple's container CLI has no --pids-limit, so
+	// PIDsLimit is skipped there.
+	Memory        string
+	CPUs          string
+	PIDsLimit     int
+	FileSizeLimit int64
 	// SELinuxRelabel appends the ":z" relabel option to every bind mount.
 	// Use ResolveSELinuxRelabel to derive it from a user-facing mode string.
 	SELinuxRelabel bool
@@ -138,9 +164,16 @@ func (r Runner) argsAt(h harness.Harness, j harness.Job, absWork, workDir string
 	args = append(args,
 		"-e", "HOME=/tmp",
 		"--tmpfs", tmpfsSpec,
-		"-v", bindMount(absWork, WorkMount, r.SELinuxRelabel),
-		"-w", workDir,
 	)
+	if r.ReadOnlyWorkspace {
+		args = append(args,
+			"-v", bindMount(absWork, WorkMount, r.SELinuxRelabel, "ro"),
+			"-v", bindMount(filepath.Join(absWork, j.OutputFile), path.Join(WorkMount, filepath.ToSlash(j.OutputFile)), r.SELinuxRelabel),
+		)
+	} else {
+		args = append(args, "-v", bindMount(absWork, WorkMount, r.SELinuxRelabel))
+	}
+	args = append(args, "-w", workDir)
 	// Backend env: model-API credential, base URL, and the backend's own
 	// telemetry / autoupdate suppressors. Bare keys pass the host's value
 	// through without putting secrets in the runtime process's argv. All
@@ -192,6 +225,7 @@ func (r Runner) argsAt(h harness.Harness, j harness.Job, absWork, workDir string
 			args = append(args, "--security-opt", "no-new-privileges")
 		}
 	}
+	args = append(args, r.limitArgs()...)
 	if r.Network != "" {
 		args = append(args, "--network", r.Network)
 	}
@@ -213,6 +247,25 @@ func (r Runner) argsAt(h harness.Harness, j harness.Job, absWork, workDir string
 		image = DefaultImage
 	}
 	return append(args, "--", image)
+}
+
+func (r Runner) limitArgs() []string {
+	var args []string
+	if r.Memory != "" {
+		args = append(args, "--memory", r.Memory)
+	}
+	if r.CPUs != "" {
+		args = append(args, "--cpus", r.CPUs)
+	}
+	// Each Apple container is its own VM, which Memory and CPUs already bound.
+	if r.PIDsLimit != 0 && r.Runtime.supportsPIDsLimit() {
+		args = append(args, "--pids-limit", strconv.Itoa(r.PIDsLimit))
+	}
+	if r.FileSizeLimit != 0 {
+		size := strconv.FormatInt(r.FileSizeLimit, 10)
+		args = append(args, "--ulimit", "fsize="+size+":"+size)
+	}
+	return args
 }
 
 func (r Runner) containerEnv(h harness.Harness, baseURL string) []string {

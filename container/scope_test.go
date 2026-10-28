@@ -231,3 +231,105 @@ func TestScopeCommandReturnsRawFailureAndRunClassifiesAccountError(t *testing.T)
 		t.Fatalf("Run error = %v, want *harness.AccountError", err)
 	}
 }
+
+func TestScopeReadOnlyWorkspacePreparesOutputFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test runtime is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	runtimePath := filepath.Join(dir, "runtime")
+	argsPath := filepath.Join(dir, "args.log")
+	if err := os.WriteFile(runtimePath, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HARNESS_ARGS_LOG\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HARNESS_ARGS_LOG", argsPath)
+	scope, err := (Runner{Runtime: Runtime{Bin: runtimePath}, ReadOnlyWorkspace: true}).Open(t.Context(), stubHarness{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scope.Close(nil)
+	workspace := t.TempDir()
+	output := filepath.Join(workspace, "report.json")
+	job := harness.Job{Workspace: workspace, OutputFile: "report.json"}
+
+	if _, err := scope.RunCommand(t.Context(), job, Command{Args: []string{"true"}}); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(output); err != nil || len(data) != 0 {
+		t.Fatalf("RunCommand did not create an empty output file: %q, %v", data, err)
+	}
+	if err := os.WriteFile(output, []byte("previous"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scope.RunCommand(t.Context(), job, Command{Args: []string{"true"}}); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(output); string(data) != "previous" {
+		t.Errorf("RunCommand changed the output file: %q", data)
+	}
+	if err := scope.Run(t.Context(), job, nil); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(output); len(data) != 0 {
+		t.Errorf("Run did not empty the output file: %q", data)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "-v " + workspace + ":" + WorkMount + ":ro -v " + output + ":" + WorkMount + "/report.json "; strings.Count(string(args), want) != 3 {
+		t.Errorf("runtime args missing %q three times:\n%s", want, args)
+	}
+}
+
+func TestScopeReadOnlyWorkspaceRejectsOutputFile(t *testing.T) {
+	scope, err := (Runner{Runtime: Runtime{Bin: filepath.Join(t.TempDir(), "missing")}, ReadOnlyWorkspace: true}).Open(t.Context(), stubHarness{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scope.Close(nil)
+	workspace := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "host.txt")
+	if err := os.WriteFile(outside, []byte("host"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inside := filepath.Join(workspace, "inside.txt")
+	if err := os.WriteFile(inside, []byte("workspace"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]string{"empty": "", "parent": "../report.json", "absolute": outside}
+	if runtime.GOOS != "windows" {
+		if err := os.Symlink(outside, filepath.Join(workspace, "link.json")); err != nil {
+			t.Fatal(err)
+		}
+		cases["symlink"] = "link.json"
+		if err := os.Symlink("inside.txt", filepath.Join(workspace, "inner.json")); err != nil {
+			t.Fatal(err)
+		}
+		cases["inner symlink"] = "inner.json"
+	}
+	for name, output := range cases {
+		t.Run(name, func(t *testing.T) {
+			job := harness.Job{Workspace: workspace, OutputFile: output}
+			if err := scope.Run(t.Context(), job, nil); err == nil || !strings.Contains(err.Error(), "output file") {
+				t.Errorf("Run error = %v", err)
+			}
+			if _, err := scope.RunCommand(t.Context(), job, Command{Args: []string{"true"}}); err == nil || !strings.Contains(err.Error(), "output file") {
+				t.Errorf("RunCommand error = %v", err)
+			}
+		})
+	}
+	if data, _ := os.ReadFile(outside); string(data) != "host" {
+		t.Errorf("host file outside the workspace changed: %q", data)
+	}
+	if data, _ := os.ReadFile(inside); string(data) != "workspace" {
+		t.Errorf("workspace file behind a symlink changed: %q", data)
+	}
+}
+
+func TestRunnerOpenRejectsReadOnlyWorkspaceOnApple(t *testing.T) {
+	_, err := (Runner{Runtime: Runtime{Bin: "apple"}, ReadOnlyWorkspace: true}).Open(t.Context(), stubHarness{})
+	if err == nil || !strings.Contains(err.Error(), "ReadOnlyWorkspace") {
+		t.Errorf("Open error = %v", err)
+	}
+}

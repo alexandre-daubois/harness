@@ -64,7 +64,13 @@ type hardenedRun struct {
 }
 
 func (r Runner) setupHardened(ctx context.Context, h harness.Harness) (hardenedRun, error) {
-	if !r.Runtime.NeedsEgressSidecar() {
+	if r.IsolateHost {
+		if err := r.Runtime.checkHostIsolation(); err != nil {
+			return hardenedRun{}, err
+		}
+	}
+	sidecar := r.IsolateHost || r.Runtime.NeedsEgressSidecar()
+	if !sidecar {
 		if r.ProxyURL == "" {
 			return hardenedRun{}, errors.New("ProxyURL is required when the runtime does not use an egress sidecar")
 		}
@@ -84,17 +90,19 @@ func (r Runner) setupHardened(ctx context.Context, h harness.Harness) (hardenedR
 			hn.cleanup(r.Runtime, nil)
 		}
 	}()
-	if err := ensureHardenedNetwork(ctx, r.Runtime, network); err != nil {
+	if err := ensureHardenedNetwork(ctx, r.Runtime, network, r.IsolateHost); err != nil {
 		return hardenedRun{}, err
 	}
 
 	image := r.image()
-	hn.gatewayIP = ResolveHostGatewayIPv4(ctx, r.Runtime, image, r.Runtime.hostGatewayProbeNetwork(network))
-	if r.Runtime.Bin == runtimeApple && hn.gatewayIP == "" {
-		return hardenedRun{}, fmt.Errorf("could not resolve the Apple network gateway for %q", network)
+	if !r.IsolateHost {
+		hn.gatewayIP = ResolveHostGatewayIPv4(ctx, r.Runtime, image, r.Runtime.hostGatewayProbeNetwork(network))
+		if r.Runtime.Bin == runtimeApple && hn.gatewayIP == "" {
+			return hardenedRun{}, fmt.Errorf("could not resolve the Apple network gateway for %q", network)
+		}
 	}
 
-	if r.Runtime.NeedsEgressSidecar() {
+	if sidecar {
 		cfg, err := r.resolveSidecarConfig(ctx, h, image)
 		if err != nil {
 			return hardenedRun{}, err
@@ -105,9 +113,14 @@ func (r Runner) setupHardened(ctx context.Context, h harness.Harness) (hardenedR
 		if err != nil {
 			return hardenedRun{}, err
 		}
+		if r.IsolateHost {
+			// The isolated network has no host gateway, so host.docker.internal
+			// resolves to the sidecar, the only peer that can reach the host.
+			hn.gatewayIP, _, _ = net.SplitHostPort(hn.proxyEndpoint)
+		}
 	}
 
-	if r.Runtime.NeedsHardenedNetVerify() {
+	if sidecar || r.Runtime.NeedsHardenedNetVerify() {
 		if err := r.verifyHardenedNetwork(ctx, hn, image); err != nil {
 			return hardenedRun{}, fmt.Errorf("verify %q: %w", network, err)
 		}
@@ -131,23 +144,30 @@ func hardenedKey() (string, error) {
 	return strconv.Itoa(os.Getpid()) + "-" + hex.EncodeToString(b[:]), nil
 }
 
-func ensureHardenedNetwork(ctx context.Context, rt Runtime, name string) error {
+func ensureHardenedNetwork(ctx context.Context, rt Runtime, name string, isolateHost bool) error {
 	if out, err := exec.CommandContext(ctx, rt.bin(), runtimeCommandNetwork, "inspect", "--", name).Output(); err == nil && len(out) > 0 {
 		return nil
 	}
-	args := hardenedNetworkCreateArgs(rt, name)
+	args := hardenedNetworkCreateArgs(rt, name, isolateHost)
 	if out, err := exec.CommandContext(ctx, rt.bin(), args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("%s network create --internal %s: %w: %s", rt.bin(), name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-func hardenedNetworkCreateArgs(rt Runtime, name string) []string {
+func hardenedNetworkCreateArgs(rt Runtime, name string, isolateHost bool) []string {
 	args := []string{runtimeCommandNetwork, "create", "--internal"}
 	if rt.needsInternalDNSDisabled() {
 		// Keep the internal resolver from shadowing DNS on the sidecar's
 		// default-network egress leg.
 		args = append(args, "--disable-dns")
+	}
+	if isolateHost {
+		// The isolated gateway mode leaves the bridge without an address on
+		// the host, so containers on it cannot reach host services.
+		args = append(args, "--ipv6=false",
+			"--opt", "com.docker.network.bridge.gateway_mode_ipv4=isolated",
+			"--opt", "com.docker.network.bridge.gateway_mode_ipv6=isolated")
 	}
 	return append(args, "--", name)
 }
@@ -520,7 +540,8 @@ type SweepResult struct {
 func SweepHardened(ctx context.Context, rt Runtime) (SweepResult, error) {
 	var result SweepResult
 	var sidecarErr error
-	if rt.NeedsEgressSidecar() {
+	// IsolateHost runs a sidecar on any Docker engine.
+	if rt.bin() == runtimeDocker || rt.NeedsEgressSidecar() {
 		result.ProxySidecars, sidecarErr = sweepProxySidecars(ctx, rt)
 	}
 	var err error

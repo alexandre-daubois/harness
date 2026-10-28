@@ -147,6 +147,28 @@ func TestRuntimeCapabilityFlags(t *testing.T) {
 	}
 }
 
+func TestRuntimeCheckHostIsolation(t *testing.T) {
+	for _, rt := range []Runtime{
+		{Bin: "docker", Version: "28.0.0"},
+		{Bin: "docker", Version: "29.1.2", DockerDesktop: true},
+	} {
+		if err := rt.checkHostIsolation(); err != nil {
+			t.Errorf("%+v: %v", rt, err)
+		}
+	}
+	for _, rt := range []Runtime{
+		{Bin: "docker", Version: "27.5.1"},
+		{Bin: "docker", Version: "unknown"},
+		{},
+		{Bin: "podman", Version: "5.4.0"},
+		{Bin: "apple", Version: "1.0.0"},
+	} {
+		if err := rt.checkHostIsolation(); err == nil {
+			t.Errorf("%+v: checkHostIsolation = nil", rt)
+		}
+	}
+}
+
 func TestDetectRuntime(t *testing.T) {
 	probeErr := errors.New("not installed")
 	appleBinary := "container"

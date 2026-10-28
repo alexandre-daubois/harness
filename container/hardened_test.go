@@ -135,6 +135,102 @@ func TestRunnerRunHardenedValidation(t *testing.T) {
 	}
 }
 
+func TestRunnerRunHardenedIsolateHost(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test runtime is a POSIX shell script")
+	}
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "runtime.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$HARNESS_RUNTIME_LOG"
+if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then
+  exit 1
+fi
+if [ "$1" = "run" ]; then
+  case "$*" in
+    *"http://1.1.1.1"*) printf '%s\n' 'BLOCKED'; exit 0 ;;
+    *"http://10.89.1.2:3128/"*) printf '%s\n' 'REACHED'; exit 0 ;;
+  esac
+fi
+if [ "$1" = "inspect" ]; then
+  printf '%s\n' '10.89.1.2'
+fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HARNESS_RUNTIME_LOG", logPath)
+
+	runner := Runner{
+		Runtime:     Runtime{Bin: "docker", Version: "28.1.1"},
+		Image:       "img:latest",
+		Hardened:    true,
+		IsolateHost: true,
+		Sidecar:     SidecarConfig{Token: "tok", APIPort: "8080", GatewayIP: "192.0.2.9"},
+	}
+	if err := runner.Run(t.Context(), stubHarness{}, harness.Job{Workspace: t.TempDir()}, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(logBytes)
+	const create = "network create --internal --ipv6=false --opt com.docker.network.bridge.gateway_mode_ipv4=isolated --opt com.docker.network.bridge.gateway_mode_ipv6=isolated -- "
+	var network, backend string
+	for line := range strings.SplitSeq(log, "\n") {
+		if name, ok := strings.CutPrefix(line, create); ok {
+			network = name
+		}
+		if strings.HasSuffix(line, "stub --headless") {
+			backend = line
+		}
+	}
+	if !strings.HasPrefix(network, hardenedNetworkPrefix) {
+		t.Fatalf("isolated network create missing from runtime log:\n%s", log)
+	}
+	for _, want := range []string{
+		"run -d --name " + strings.Replace(network, hardenedNetworkPrefix, proxySidecarPrefix, 1) + " --network " + network,
+		"network connect -- bridge",
+		"http://1.1.1.1",
+		"http://10.89.1.2:3128/",
+		"network rm -- " + network,
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("runtime log missing %q:\n%s", want, log)
+		}
+	}
+	for _, want := range []string{"--network " + network, "--add-host " + egress.HostGatewayAlias + ":10.89.1.2", "-e HTTPS_PROXY"} {
+		if !strings.Contains(backend, want) {
+			t.Errorf("backend run missing %q: %s", want, backend)
+		}
+	}
+	if strings.Contains(log, "--entrypoint grep") {
+		t.Errorf("host gateway resolved on the isolated network:\n%s", log)
+	}
+}
+
+func TestRunnerOpenRejectsUnsupportedIsolateHost(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		runner Runner
+		want   string
+	}{
+		{"not hardened", Runner{Runtime: Runtime{Bin: "docker", Version: "28.1.1"}, IsolateHost: true}, "requires Hardened"},
+		{"podman", Runner{Runtime: Runtime{Bin: "podman", Rootless: true}, Hardened: true, IsolateHost: true}, "requires Docker Engine, not podman"},
+		{"old docker", Runner{Runtime: Runtime{Bin: "docker", Version: "27.5.1"}, Hardened: true, IsolateHost: true}, "28 or newer"},
+		{"unknown docker", Runner{Hardened: true, IsolateHost: true}, "28 or newer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.runner.Open(t.Context(), stubHarness{}); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Open error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunnerOpenPreservesCancellationDuringSidecarReadiness(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test runtime is a POSIX shell script")
@@ -301,15 +397,24 @@ func TestHardenedProbeArgs(t *testing.T) {
 }
 
 func TestHardenedNetworkCreateArgs(t *testing.T) {
-	docker := hardenedNetworkCreateArgs(Runtime{Bin: "docker"}, "harness-hardened-a")
+	docker := hardenedNetworkCreateArgs(Runtime{Bin: "docker"}, "harness-hardened-a", false)
 	if slices.Contains(docker, "--disable-dns") {
 		t.Errorf("docker args contain unsupported --disable-dns: %v", docker)
 	}
-	podman := hardenedNetworkCreateArgs(Runtime{Bin: "podman", Rootless: true}, "harness-hardened-a")
+	if slices.Contains(docker, "--opt") || slices.Contains(docker, "--ipv6=false") {
+		t.Errorf("docker args isolate the gateway without IsolateHost: %v", docker)
+	}
+	podman := hardenedNetworkCreateArgs(Runtime{Bin: "podman", Rootless: true}, "harness-hardened-a", false)
 	if !slices.Contains(podman, "--disable-dns") {
 		t.Errorf("rootless podman args missing --disable-dns: %v", podman)
 	}
-	for _, args := range [][]string{docker, podman} {
+	isolated := hardenedNetworkCreateArgs(Runtime{Bin: "docker"}, "harness-hardened-a", true)
+	if !slices.Contains(isolated, "--ipv6=false") ||
+		!hasAdjacent(isolated, "--opt", "com.docker.network.bridge.gateway_mode_ipv4=isolated") ||
+		!hasAdjacent(isolated, "--opt", "com.docker.network.bridge.gateway_mode_ipv6=isolated") {
+		t.Errorf("IsolateHost args missing isolated gateways or IPv6 opt-out: %v", isolated)
+	}
+	for _, args := range [][]string{docker, podman, isolated} {
 		if tail := args[len(args)-2:]; !slices.Equal(tail, []string{"--", "harness-hardened-a"}) {
 			t.Errorf("network name is not protected by --: %v", args)
 		}
@@ -428,6 +533,44 @@ exit 0
 	}
 	if strings.Contains(log, "rm -f -- my-") || strings.Contains(log, "network rm -- my-") {
 		t.Errorf("sweep removed a substring-only match: %s", log)
+	}
+}
+
+func TestSweepHardenedRemovesDockerEngineSidecars(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test runtime is a POSIX shell script")
+	}
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "runtime.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$HARNESS_RUNTIME_LOG"
+if [ "$1" = "ps" ]; then
+  printf '%s\n' 'harness-proxy-c'
+fi
+if [ "$1" = "inspect" ]; then
+  printf '%s\n' '999999'
+fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HARNESS_RUNTIME_LOG", logPath)
+
+	result, err := SweepHardened(t.Context(), Runtime{Bin: "docker", Version: "28.1.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProxySidecars != 1 {
+		t.Errorf("result = %+v", result)
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logBytes), "rm -f -- harness-proxy-c") {
+		t.Errorf("sweep kept a dead process's sidecar:\n%s", logBytes)
 	}
 }
 

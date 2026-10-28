@@ -51,8 +51,8 @@ type Job struct {
 	SystemPrompt string
 
 	Model string
-	// Effort is the backend-native reasoning effort accepted by Claude and
-	// Copilot. An empty value leaves the backend default unchanged.
+	// Effort is the backend-native reasoning effort accepted by Claude, Codex,
+	// and Copilot. An empty value leaves the backend default unchanged.
 	Effort   string
 	MaxTurns int
 

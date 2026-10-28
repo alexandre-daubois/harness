@@ -6,7 +6,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/alpha-omega-security/harness"
 )
+
+func spent(requests, input, output, cacheRead, cacheWrite int) Usage {
+	return Usage{Usage: harness.Usage{InputTokens: input, OutputTokens: output, CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite}, Requests: requests}
+}
 
 // spend relays one request to an upstream answering with body, and returns what the run spent once revoked.
 func spend(t *testing.T, p Provider, route string, status int, contentType, body string) Usage {
@@ -43,19 +49,22 @@ func TestUsageOfAResponse(t *testing.T) {
 	}{
 		"anthropic message": {Anthropic, "/v1/messages", "application/json",
 			`{"type":"message","usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":5}}`,
-			Usage{Requests: 1, InputTokens: 60, OutputTokens: 5}},
+			spent(1, 60, 5, 30, 20)},
 		"anthropic stream": {Anthropic, "/v1/messages", "text/event-stream; charset=utf-8",
 			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":30,\"output_tokens\":1}}}\n\n" +
 				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"usage\"}}\n\n" +
 				"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
-			Usage{Requests: 1, InputTokens: 40, OutputTokens: 42}},
+			spent(1, 40, 42, 30, 0)},
 		"responses stream": {OpenAI, "/v1/responses", "text/event-stream",
 			"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"usage\":null}}\n\n" +
 				"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":7}}}\n\n",
-			Usage{Requests: 1, InputTokens: 100, OutputTokens: 7}},
+			spent(1, 100, 7, 0, 0)},
+		"responses cached input": {OpenAI, "/v1/responses", "application/json",
+			`{"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":80},"output_tokens":7}}`,
+			spent(1, 100, 7, 80, 0)},
 		"stream without usage": {OpenAI, "/v1/responses", "text/event-stream",
 			"data: not json\n\ndata: {\"usage\":\"many\"}\n\ndata: [DONE]\n\n",
-			Usage{Requests: 1}},
+			spent(1, 0, 0, 0, 0)},
 		"token count": {Anthropic, "/v1/messages/count_tokens", "application/json", `{"input_tokens":10}`, Usage{}},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -76,7 +85,7 @@ func TestUsageReaderKeepsAnUnterminatedLastEvent(t *testing.T) {
 
 	_, _ = io.Copy(io.Discard, r)
 
-	if want := (Usage{Requests: 1, InputTokens: 3, OutputTokens: 2}); got != want {
+	if want := spent(1, 3, 2, 0, 0); got != want {
 		t.Errorf("usage = %+v, want %+v", got, want)
 	}
 }
@@ -94,7 +103,7 @@ func TestUsageReaderCountsAStreamClosedEarly(t *testing.T) {
 	_ = r.Close()
 	_ = r.Close()
 
-	if want := []Usage{{Requests: 1, InputTokens: 10, OutputTokens: 1}}; len(calls) != 1 || calls[0] != want[0] {
+	if want := []Usage{spent(1, 10, 1, 0, 0)}; len(calls) != 1 || calls[0] != want[0] {
 		t.Errorf("usage = %+v, want %+v", calls, want)
 	}
 }
@@ -131,7 +140,7 @@ func TestUsageIsCountedPerToken(t *testing.T) {
 	if got := revokeSecond(); got != (Usage{}) {
 		t.Errorf("the second run was charged: %+v", got)
 	}
-	if got, want := revokeFirst(), (Usage{Requests: 2, InputTokens: 20, OutputTokens: 10}); got != want {
+	if got, want := revokeFirst(), spent(2, 20, 10, 0, 0); got != want {
 		t.Errorf("usage = %+v, want %+v", got, want)
 	}
 	if got := revokeFirst(); got != (Usage{}) {

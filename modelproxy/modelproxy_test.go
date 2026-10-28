@@ -850,3 +850,52 @@ func TestExpectedRefusalsDoNotSpendTheQuota(t *testing.T) {
 		t.Errorf("upstream calls = %d, want 1", len(*calls))
 	}
 }
+
+func TestOpenAIDropsTheServiceTier(t *testing.T) {
+	srv, calls, token := setup(t, OpenAI, http.StatusOK)
+
+	resp := callBody(t, srv, http.MethodPost, PathPrefix+"/v1/responses", `{"model":"allowed","service_tier":"priority"}`, withKey("Authorization", "Bearer "+token))
+
+	wantStatus(t, resp, http.StatusOK, "responses")
+	if len(*calls) != 1 || strings.Contains((*calls)[0].body, "service_tier") {
+		t.Errorf("the service tier reached the upstream: %+v", *calls)
+	}
+}
+
+func TestLongestUpstreamPrefixWins(t *testing.T) {
+	p := Provider{
+		Upstreams: map[string]string{"": "https://root.example/root", "/auth": "https://auth.example/accounts"},
+		Routes:    func(string, string) bool { return true },
+		SetKey:    func(http.Header, string) {},
+	}
+	srv, calls, token := setup(t, p, http.StatusOK)
+
+	for range 20 {
+		wantStatus(t, call(t, srv, http.MethodGet, PathPrefix+"/auth/whoami", withKey("X-Api-Key", token)), http.StatusOK, "auth route")
+		wantStatus(t, call(t, srv, http.MethodGet, PathPrefix+"/authz", withKey("X-Api-Key", token)), http.StatusOK, "root route")
+	}
+
+	for i, got := range *calls {
+		want := "/accounts/whoami"
+		if i%2 == 1 {
+			want = "/root/authz"
+		}
+		if got.path != want {
+			t.Fatalf("call %d reached %q, want %q", i, got.path, want)
+		}
+	}
+}
+
+func TestRouteNoUpstreamServesIsRefused(t *testing.T) {
+	p := Provider{
+		Upstreams: map[string]string{"/auth": "https://auth.example/accounts"},
+		Routes:    func(string, string) bool { return true },
+		SetKey:    func(http.Header, string) {},
+	}
+	srv, calls, token := setup(t, p, http.StatusOK)
+
+	wantStatus(t, call(t, srv, http.MethodGet, PathPrefix+"/backend-api/codex/models", withKey("X-Api-Key", token)), http.StatusForbidden, "unserved route")
+	if len(*calls) != 0 {
+		t.Errorf("an unserved route reached an upstream: %+v", *calls)
+	}
+}

@@ -37,6 +37,24 @@ const (
 
 var errUpstreamRedirect = errors.New("model proxy: upstream redirect refused")
 
+// anthropicBetas are the Anthropic-Beta values forwarded upstream, the others are dropped.
+var anthropicBetas = []string{
+	"claude-code-20250219",
+	"interleaved-thinking-2025-05-14",
+	"fine-grained-tool-streaming-2025-05-14",
+	"context-management-2025-06-27",
+	"effort-2025-11-24",
+	"adaptive-thinking-2026-01-28",
+	"structured-outputs-2025-11-13",
+	"prompt-caching-2024-07-31",
+	"tool-search-tool-2025-10-19",
+	"per-turn-control-2026-07-01",
+	"mid-conversation-tool-changes-2026-07-01",
+	"thinking-display-updates-2026-08-18",
+	"thinking-token-count-2026-05-13",
+	"prompt-caching-scope-2026-01-05",
+}
+
 var clientVersion = regexp.MustCompile(`^client_version=[0-9]+(\.[0-9]+)*$`)
 
 // runKey carries the hash of the token a request came with, so its response is counted for that run.
@@ -217,14 +235,8 @@ func New(provider Provider, key, model string, opts Options) (*Proxy, error) {
 }
 
 func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
-	// ServeHTTP only forwards permitted routes, each under exactly one prefix.
-	var upstream *url.URL
-	route := pr.In.URL.Path
-	for prefix, u := range p.upstreams {
-		if rest, ok := strings.CutPrefix(pr.In.URL.Path, prefix); ok && (prefix == "" || strings.HasPrefix(rest, "/")) {
-			upstream, route = u, rest
-		}
-	}
+	// ServeHTTP only forwards routes an upstream serves.
+	upstream, route, _ := p.upstreamFor(pr.In.URL.Path)
 	pr.Out.URL.Scheme, pr.Out.URL.Host, pr.Out.Host = upstream.Scheme, upstream.Host, upstream.Host
 	pr.Out.URL.Path, pr.Out.URL.RawPath = upstream.Path+route, ""
 	// New provider capabilities must not be enabled through a client-supplied header.
@@ -236,7 +248,7 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 		var betas []string
 		for _, beta := range strings.Split(pr.In.Header.Get("Anthropic-Beta"), ",") {
 			beta = strings.TrimSpace(beta)
-			if slices.Contains([]string{"claude-code-20250219", "interleaved-thinking-2025-05-14", "fine-grained-tool-streaming-2025-05-14", "context-management-2025-06-27", "effort-2025-11-24", "adaptive-thinking-2026-01-28", "structured-outputs-2025-11-13", "prompt-caching-2024-07-31", "tool-search-tool-2025-10-19", "per-turn-control-2026-07-01", "mid-conversation-tool-changes-2026-07-01", "thinking-display-updates-2026-08-18", "thinking-token-count-2026-05-13", "prompt-caching-scope-2026-01-05"}, beta) {
+			if slices.Contains(anthropicBetas, beta) {
 				betas = append(betas, beta)
 			}
 		}
@@ -253,6 +265,19 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 			pr.Out.Header.Set("ChatGPT-Account-Id", accountID)
 		}
 	}
+}
+
+// upstreamFor returns the upstream of the longest prefix route starts with, and what route leaves under it.
+func (p *Proxy) upstreamFor(route string) (*url.URL, string, bool) {
+	var upstream *url.URL
+	rest, longest := route, -1
+	for prefix, u := range p.upstreams {
+		if r, ok := strings.CutPrefix(route, prefix); ok && (prefix == "" || strings.HasPrefix(r, "/")) && len(prefix) > longest {
+			upstream, rest, longest = u, r, len(prefix)
+		}
+	}
+
+	return upstream, rest, upstream != nil
 }
 
 func (p *Proxy) modifyResponse(resp *http.Response) error {
@@ -325,7 +350,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r = r.Clone(context.WithValue(r.Context(), runKey{}, sum))
-	if r.URL.RawPath != "" || (r.URL.RawQuery != "" && (p.provider.Query == nil || !p.provider.Query(route, r.URL.RawQuery))) || path.Clean(route) != route || !p.provider.Routes(r.Method, route) {
+	_, _, served := p.upstreamFor(route)
+	if !served || r.URL.RawPath != "" || (r.URL.RawQuery != "" && (p.provider.Query == nil || !p.provider.Query(route, r.URL.RawQuery))) || path.Clean(route) != route || !p.provider.Routes(r.Method, route) {
 		if p.provider.Unlogged[r.Method+" "+route] {
 			// These refusals would otherwise spend the requests the agent needs for the model.
 			p.mu.Lock()
@@ -456,6 +482,8 @@ func (p *Proxy) safeBody(b []byte) ([]byte, error) {
 		return nil, errors.New("provider request not permitted")
 	}
 	delete(v, "client_metadata")
+	// A priority tier would raise what a run costs, which pinning the model bounds.
+	delete(v, "service_tier")
 	for _, key := range []string{"max_tokens", "max_output_tokens"} {
 		if raw, ok := v[key]; ok {
 			n, ok := raw.(json.Number)

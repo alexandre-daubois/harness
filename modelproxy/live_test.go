@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/alpha-omega-security/harness"
 )
 
 // These tests pin that the usage the proxy counts for a real agent CLI run equals the one the CLI reports:
@@ -83,16 +85,16 @@ func TestLiveClaudeCodeUsage(t *testing.T) {
 
 	var result struct {
 		Usage struct {
-			InputTokens   int64 `json:"input_tokens"`
-			CacheCreation int64 `json:"cache_creation_input_tokens"`
-			CacheRead     int64 `json:"cache_read_input_tokens"`
-			OutputTokens  int64 `json:"output_tokens"`
+			InputTokens   int `json:"input_tokens"`
+			CacheCreation int `json:"cache_creation_input_tokens"`
+			CacheRead     int `json:"cache_read_input_tokens"`
+			OutputTokens  int `json:"output_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	cli := Usage{InputTokens: result.Usage.InputTokens + result.Usage.CacheCreation + result.Usage.CacheRead, OutputTokens: result.Usage.OutputTokens}
+	cli := harness.Usage{InputTokens: result.Usage.InputTokens + result.Usage.CacheCreation + result.Usage.CacheRead, OutputTokens: result.Usage.OutputTokens}
 	t.Logf("cli: %+v", cli)
 	if spent.Requests < 2 || spent.InputTokens != cli.InputTokens || spent.OutputTokens != cli.OutputTokens {
 		t.Errorf("proxy counted %+v, the CLI reported %+v", spent, cli)
@@ -113,15 +115,15 @@ func TestLiveCodexUsage(t *testing.T) {
 		return c
 	})
 
-	var cli Usage
+	var cli harness.Usage
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	scanner.Buffer(nil, 1<<20)
 	for scanner.Scan() {
 		var event struct {
 			Type  string `json:"type"`
 			Usage struct {
-				InputTokens  int64 `json:"input_tokens"`
-				OutputTokens int64 `json:"output_tokens"`
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
 			} `json:"usage"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &event) == nil && event.Type == "turn.completed" {

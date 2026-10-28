@@ -5,17 +5,27 @@ import (
 	"encoding/json"
 	"io"
 	"sync"
+
+	"github.com/alpha-omega-security/harness"
 )
 
-// Usage counts billed requests. Input tokens include the cached ones, which providers bill at another rate.
+// Usage counts billed requests and their tokens. InputTokens includes the cache reads and writes, which
+// harness.CostFromUsage prices at their own rate.
 type Usage struct {
-	Requests     int64
-	InputTokens  int64
-	OutputTokens int64
+	harness.Usage
+	Requests int
 }
 
 func (u Usage) plus(o Usage) Usage {
-	return Usage{u.Requests + o.Requests, u.InputTokens + o.InputTokens, u.OutputTokens + o.OutputTokens}
+	return Usage{
+		Usage: harness.Usage{
+			InputTokens:      u.InputTokens + o.InputTokens,
+			OutputTokens:     u.OutputTokens + o.OutputTokens,
+			CacheReadTokens:  u.CacheReadTokens + o.CacheReadTokens,
+			CacheWriteTokens: u.CacheWriteTokens + o.CacheWriteTokens,
+		},
+		Requests: u.Requests + o.Requests,
+	}
 }
 
 // usageReader reads the tokens a model response reports, as one JSON body or as server-sent events, while the
@@ -66,10 +76,13 @@ func (u *usageReader) finish() {
 }
 
 type reported struct {
-	InputTokens   int64 `json:"input_tokens"`
-	CacheCreation int64 `json:"cache_creation_input_tokens"`
-	CacheRead     int64 `json:"cache_read_input_tokens"`
-	OutputTokens  int64 `json:"output_tokens"`
+	InputTokens   int `json:"input_tokens"`
+	CacheCreation int `json:"cache_creation_input_tokens"`
+	CacheRead     int `json:"cache_read_input_tokens"`
+	OutputTokens  int `json:"output_tokens"`
+	InputDetails  struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
 }
 
 // observe looks where Anthropic and the Responses API put the usage: at the top of a message or of a
@@ -95,8 +108,10 @@ func (u *usageReader) observe(data []byte) {
 		if r == nil {
 			continue
 		}
-		// Anthropic leaves cached tokens out of input_tokens, OpenAI counts them in.
+		// Anthropic leaves cached tokens out of input_tokens, OpenAI counts them in and details the cache reads.
 		u.tokens.InputTokens = max(u.tokens.InputTokens, r.InputTokens+r.CacheCreation+r.CacheRead)
+		u.tokens.CacheReadTokens = max(u.tokens.CacheReadTokens, r.CacheRead+r.InputDetails.CachedTokens)
+		u.tokens.CacheWriteTokens = max(u.tokens.CacheWriteTokens, r.CacheCreation)
 		u.tokens.OutputTokens = max(u.tokens.OutputTokens, r.OutputTokens)
 	}
 }

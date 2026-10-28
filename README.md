@@ -312,7 +312,9 @@ clamped to 16,000, and client headers are dropped apart from `Accept` and
 reviewed `Anthropic-Beta` values. A token stops working when it is revoked,
 when the context it was issued with is done, or after `Options.MaxRequests`
 requests (150 by default). Revoking returns the `Usage` the run's responses
-reported. `Options.Charge` is called with the issuing context and the size of
+reported, a `harness.Usage` with the cache reads and writes kept apart so
+`CostFromUsage` prices them, plus the request count. The OpenAI `service_tier`
+is dropped so a run cannot pick a dearer tier. `Options.Charge` is called with the issuing context and the size of
 each POST body before it is forwarded, so a caller can charge a shared budget,
 and `Options.Log` receives refusals without conversation text.
 `NewCertificate` returns a throwaway CA and a server certificate for the HTTPS

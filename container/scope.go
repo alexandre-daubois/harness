@@ -48,6 +48,14 @@ func (r Runner) Open(ctx context.Context, h harness.Harness) (*Scope, error) {
 		}
 		r.StateDir = abs
 	}
+	if r.ReadOnlyWorkspace && r.Runtime.Bin == runtimeApple {
+		// Apple's container CLI replaces a directory share with a file mounted
+		// inside it (apple/container#2148), which would hide the workspace.
+		return nil, fmt.Errorf("container: ReadOnlyWorkspace is not supported on Apple's container runtime")
+	}
+	if r.IsolateHost && !r.Hardened {
+		return nil, fmt.Errorf("container: IsolateHost requires Hardened")
+	}
 	processEnv, err := overlayProcessEnv(os.Environ(), r.ProcessEnv)
 	if err != nil {
 		return nil, err
@@ -117,6 +125,11 @@ func (s *Scope) run(ctx context.Context, j harness.Job, emit func(harness.Event)
 	if err != nil {
 		return fmt.Errorf("container: workspace: %w", err)
 	}
+	if s.runner.ReadOnlyWorkspace {
+		if err := createOutputFile(absWork, j.OutputFile, os.O_TRUNC); err != nil {
+			return err
+		}
+	}
 	cj := j
 	cj.Workspace = WorkMount
 	args := s.runner.args(s.harness, cj, absWork)
@@ -160,6 +173,11 @@ func (s *Scope) RunCommand(ctx context.Context, j harness.Job, command Command) 
 	if err != nil {
 		return nil, fmt.Errorf("container: workspace: %w", err)
 	}
+	if s.runner.ReadOnlyWorkspace {
+		if err := createOutputFile(absWork, j.OutputFile, 0); err != nil {
+			return nil, err
+		}
+	}
 	workDir := command.WorkDir
 	if workDir == "" {
 		workDir = WorkMount
@@ -200,6 +218,31 @@ func validateJob(h harness.Harness, j harness.Job) error {
 		return fmt.Errorf("container: workspace is required")
 	}
 	return nil
+}
+
+const outputFileMode os.FileMode = 0o600
+
+// createOutputFile opens name under workspace with O_CREATE and flag, so the
+// file exists to be bind-mounted over the read-only workspace. os.Root keeps a
+// symlink in the workspace from pointing that writable mount outside it, and a
+// symlinked output file is rejected so it cannot expose another workspace file.
+func createOutputFile(workspace, name string, flag int) error {
+	if !filepath.IsLocal(name) {
+		return fmt.Errorf("container: ReadOnlyWorkspace needs an output file inside the workspace, got %q", name)
+	}
+	root, err := os.OpenRoot(workspace)
+	if err != nil {
+		return fmt.Errorf("container: workspace: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	if info, err := root.Lstat(name); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("container: output file %q is a symlink", name)
+	}
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|flag, outputFileMode)
+	if err != nil {
+		return fmt.Errorf("container: output file: %w", err)
+	}
+	return f.Close()
 }
 
 func overlayProcessEnv(base, overrides []string) ([]string, error) {

@@ -39,8 +39,8 @@ type Runtime struct {
 	Rootless      bool   // true only for rootless podman
 	DockerDesktop bool   // true when the detected docker daemon is Docker Desktop
 	// Version is the engine version captured at detection (e.g. "4.9.4").
-	// Best-effort and only used for the startup host-gateway check; "" when
-	// unknown.
+	// Best-effort; "" when unknown. Runner.IsolateHost refuses to run when it
+	// is unknown or older than Docker Engine 28.
 	Version string
 }
 
@@ -135,6 +135,28 @@ func (rt Runtime) supportsPullNever() bool {
 // supportsNoNewPrivileges reports whether the runtime accepts Docker/Podman's
 // `--security-opt no-new-privileges` hardening flag.
 func (rt Runtime) supportsNoNewPrivileges() bool {
+	return rt.Bin != runtimeApple
+}
+
+// dockerIsolatedGatewayMajor is the first Docker Engine release whose bridge
+// driver accepts the isolated gateway mode on an internal network.
+const dockerIsolatedGatewayMajor = 28
+
+// checkHostIsolation reports why Runner.IsolateHost cannot run on rt.
+func (rt Runtime) checkHostIsolation() error {
+	if rt.bin() != runtimeDocker {
+		return fmt.Errorf("IsolateHost requires Docker Engine, not %s", rt.bin())
+	}
+	major, _, ok := parseMajorMinor(rt.Version)
+	if !ok || major < dockerIsolatedGatewayMajor {
+		return fmt.Errorf("IsolateHost requires Docker Engine %d or newer, detected version %q", dockerIsolatedGatewayMajor, rt.Version)
+	}
+	return nil
+}
+
+// supportsPIDsLimit reports whether the runtime accepts `--pids-limit`.
+// Apple's container CLI does not expose it.
+func (rt Runtime) supportsPIDsLimit() bool {
 	return rt.Bin != runtimeApple
 }
 

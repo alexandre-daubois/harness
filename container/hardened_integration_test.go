@@ -161,3 +161,65 @@ func TestIntegrationHardenedDockerProxy(t *testing.T) {
 		t.Fatalf("proxied output = %q", out)
 	}
 }
+
+func TestIntegrationHardenedIsolateHost(t *testing.T) {
+	image := os.Getenv("HARNESS_TEST_RUNNER_IMAGE")
+	if image == "" {
+		t.Skip("set HARNESS_TEST_RUNNER_IMAGE to a cached image containing sh, curl, grep, and harness-proxy")
+	}
+	rt, ok := DetectRuntime("docker")
+	if !ok {
+		t.Skip("docker is unavailable")
+	}
+	if err := rt.checkHostIsolation(); err != nil {
+		t.Skip(err)
+	}
+	if !imageExistsLocally(t.Context(), rt, image) {
+		t.Skipf("image %q is not cached", image)
+	}
+
+	listener, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "proxied")
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	hostIP := ResolveHostGatewayIPv4(t.Context(), rt, image, "")
+	if hostIP == "" {
+		t.Fatal("could not resolve the host gateway")
+	}
+
+	runner := Runner{Runtime: rt, Image: image, Hardened: true, IsolateHost: true, Sidecar: SidecarConfig{APIPort: port}}
+	if sidecarImage := os.Getenv("HARNESS_TEST_SIDECAR_IMAGE"); sidecarImage != "" {
+		runner.Sidecar.Image = sidecarImage
+	}
+	scope, err := runner.Open(t.Context(), integrationHarness{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { scope.Close(nil) })
+	out, err := exec.CommandContext(t.Context(), rt.bin(), "network", "inspect", "--format",
+		`{{.Internal}} {{.EnableIPv6}} {{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}} {{index .Options "com.docker.network.bridge.gateway_mode_ipv6"}}`,
+		"--", scope.hardened.network).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "true false isolated isolated" {
+		t.Fatalf("network options = %q", got)
+	}
+	out, err = scope.RunCommand(t.Context(), harness.Job{Workspace: t.TempDir()}, Command{
+		Args: []string{"sh", "-c", `curl -fsS "http://host.docker.internal:` + port + `/probe" &&
+! curl -fsS --noproxy '*' --connect-timeout 2 "http://host.docker.internal:` + port + `/" 2>/dev/null &&
+! curl -fsS --noproxy '*' --connect-timeout 2 "http://` + net.JoinHostPort(hostIP, port) + `/" 2>/dev/null`},
+	})
+	if err != nil {
+		t.Fatalf("isolation probe: %v: %s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "proxied" {
+		t.Fatalf("proxied output = %q", out)
+	}
+}

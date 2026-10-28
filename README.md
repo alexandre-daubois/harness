@@ -289,7 +289,14 @@ internal network cannot reach its host proxy. Other runtimes use
 path need curl and the `cmd/harness-proxy` binary. Call `SweepHardened` during
 startup to remove networks and sidecars left by an interrupted process.
 Sidecar images must be rebuilt when Harness changes its proxy policy; stale
-images fail closed.
+images fail closed. `Runner.IsolateHost` makes a hardened run on Docker Engine
+28 or newer create that network with isolated gateways and IPv6 disabled, run
+the same sidecar, and alias `host.docker.internal` to it, so the backend cannot
+reach host services directly. It fails on other runtimes and on older or
+unknown engine versions. `Runner.ReadOnlyWorkspace` mounts the workspace
+read-only except for `Job.OutputFile`, which `Run` empties on the host before
+each invocation. `Runner.Memory`, `CPUs`, `PIDsLimit`, and `FileSizeLimit` add
+`--memory`, `--cpus`, `--pids-limit`, and an `fsize` ulimit when set.
 
 `egress` contains the authenticated allowlist proxy and
 `WriteSandboxSettings`, which writes Claude's `.claude/settings.json` domain

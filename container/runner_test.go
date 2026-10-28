@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"io"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -151,6 +152,55 @@ func TestRunnerArgs_ReadOnly(t *testing.T) {
 	off := Runner{}.args(stubHarness{}, harness.Job{Workspace: WorkMount}, "/abs/work")
 	if slices.Contains(off, "--read-only") || hasAdjacent(off, "--security-opt", "no-new-privileges") {
 		t.Errorf("default: must not set --read-only / no-new-privileges: %v", off)
+	}
+}
+
+func TestRunnerArgs_Limits(t *testing.T) {
+	limited := Runner{Memory: "2g", CPUs: "2", PIDsLimit: 256, FileSizeLimit: 67108864}
+	got := limited.args(stubHarness{}, harness.Job{Workspace: WorkMount}, "/abs/work")
+	for _, pair := range [][2]string{
+		{"--memory", "2g"},
+		{"--cpus", "2"},
+		{"--pids-limit", "256"},
+		{"--ulimit", "fsize=67108864:67108864"},
+	} {
+		if !hasAdjacent(got, pair[0], pair[1]) {
+			t.Errorf("missing %s %s in %v", pair[0], pair[1], got)
+		}
+	}
+	limited.Runtime = Runtime{Bin: "apple"}
+	apple := limited.args(stubHarness{}, harness.Job{Workspace: WorkMount}, "/abs/work")
+	if slices.Contains(apple, "--pids-limit") {
+		t.Errorf("apple: must not set --pids-limit: %v", apple)
+	}
+	if !hasAdjacent(apple, "--memory", "2g") || !hasAdjacent(apple, "--ulimit", "fsize=67108864:67108864") {
+		t.Errorf("apple: expected the supported limits in %v", apple)
+	}
+	none := Runner{}.args(stubHarness{}, harness.Job{Workspace: WorkMount}, "/abs/work")
+	for _, flag := range []string{"--memory", "--cpus", "--pids-limit", "--ulimit"} {
+		if slices.Contains(none, flag) {
+			t.Errorf("default: unexpected %s in %v", flag, none)
+		}
+	}
+}
+
+func TestRunnerArgs_ReadOnlyWorkspace(t *testing.T) {
+	job := harness.Job{Workspace: WorkMount, OutputFile: "report.json"}
+	output := filepath.Join("/abs/work", "report.json") + ":" + WorkMount + "/report.json"
+	got := Runner{ReadOnlyWorkspace: true}.args(stubHarness{}, job, "/abs/work")
+	if !hasAdjacent(got, "-v", "/abs/work:"+WorkMount+":ro") || !hasAdjacent(got, "-v", output) {
+		t.Errorf("expected a read-only workspace and a writable output file: %v", got)
+	}
+	if hasAdjacent(got, "-v", "/abs/work:"+WorkMount) {
+		t.Errorf("writable workspace mount remains: %v", got)
+	}
+	relabel := Runner{ReadOnlyWorkspace: true, SELinuxRelabel: true}.args(stubHarness{}, job, "/abs/work")
+	if !hasAdjacent(relabel, "-v", "/abs/work:"+WorkMount+":ro,z") || !hasAdjacent(relabel, "-v", output+":z") {
+		t.Errorf("relabel: expected ro,z workspace and z output file: %v", relabel)
+	}
+	off := Runner{}.args(stubHarness{}, job, "/abs/work")
+	if !hasAdjacent(off, "-v", "/abs/work:"+WorkMount) || hasAdjacent(off, "-v", output) {
+		t.Errorf("default: expected only a writable workspace mount: %v", off)
 	}
 }
 

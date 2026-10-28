@@ -312,6 +312,25 @@ TCP services.
 It accepts a caller-owned HTTP client and permits plain HTTP only for local
 development endpoints.
 
+`modelproxy` keeps a model credential on the host. `New` wraps one key for a
+`Provider` (`Anthropic`, `OpenAI`, or `ChatGPT` for Codex signed in with an
+access token) and one model, and `Issue` mints a token per sandboxed run that
+the proxy, served under `PathPrefix`, swaps for the key on a fixed list of
+routes. Request bodies must name that model and pass a field-by-field check of
+the protocol positions reviewed for the provider, output token limits are
+clamped to 16,000, and client headers are dropped apart from `Accept` and
+reviewed `Anthropic-Beta` values. A token stops working when it is revoked,
+when the context it was issued with is done, or after `Options.MaxRequests`
+requests (150 by default). Revoking returns the `Usage` the run's responses
+reported, a `harness.Usage` with the cache reads and writes kept apart so
+`CostFromUsage` prices them, plus the request count. The OpenAI `service_tier`
+is dropped so a run cannot pick a dearer tier. `Options.Charge` is called with
+the issuing context and the size of each POST body before it is forwarded, so
+a caller can charge a shared budget, and `Options.Log` receives refusals
+without conversation text.
+`NewCertificate` returns a throwaway CA and a server certificate for the HTTPS
+listener the `ChatGPT` provider needs.
+
 ## License
 
 MIT

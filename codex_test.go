@@ -43,6 +43,55 @@ func TestCodexArgsAndStream(t *testing.T) {
 	}
 }
 
+func TestCodexArgsConfigOverrides(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		job    Job
+		want   []string
+		absent string
+	}{
+		{
+			name: "defaults",
+			want: []string{
+				"-c", "analytics.enabled=false",
+				"-c", "features.apps=false",
+				"-c", "features.plugins=false",
+				"exec",
+			},
+			absent: "model_reasoning_effort=",
+		},
+		{
+			name: "effort",
+			job:  Job{Effort: "xhigh"},
+			want: []string{"-c", `model_reasoning_effort="xhigh"`, "exec"},
+		},
+		{
+			name: "effort that would break out of the TOML string",
+			job:  Job{Effort: "high\"\nsandbox_mode=\"x"},
+			want: []string{"-c", `model_reasoning_effort=""`, "exec"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			args := CodexHarness{}.Args(test.job)
+			exec := slices.Index(args, "exec")
+			if exec+1 < len(test.want) || !slices.Equal(args[exec-len(test.want)+1:exec+1], test.want) {
+				t.Errorf("Args() = %q, want %q before the exec subcommand", args, test.want)
+			}
+			if test.absent == "" {
+				return
+			}
+			if i := slices.IndexFunc(args, func(arg string) bool { return strings.HasPrefix(arg, test.absent) }); i >= 0 {
+				t.Errorf("Args() contains %q: %q", args[i], args)
+			}
+		})
+	}
+}
+
 func TestCodexToolItems(t *testing.T) {
 	t.Parallel()
 

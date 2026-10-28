@@ -18,9 +18,19 @@ func (CodexHarness) Binary() string { return "codex" }
 // id after "exec resume". Codex has no per-turn cap, so Job.MaxTurns is
 // intentionally ignored.
 func (CodexHarness) Args(j Job) []string {
-	var args []string
+	args := []string{
+		// Analytics posts to the ChatGPT backend, apps registers a
+		// ChatGPT-hosted MCP server, and plugins syncs a curated catalog from
+		// GitHub at startup. None of them serve a headless run.
+		"-c", "analytics.enabled=false",
+		"-c", "features.apps=false",
+		"-c", "features.plugins=false",
+	}
 	if j.BaseURL != "" {
 		args = append(args, "-c", "openai_base_url="+codexConfigValue(j.BaseURL))
+	}
+	if j.Effort != "" {
+		args = append(args, "-c", "model_reasoning_effort="+codexConfigValue(j.Effort))
 	}
 	args = append(args,
 		"exec",
@@ -42,9 +52,9 @@ func (CodexHarness) Args(j Job) []string {
 }
 
 // codexConfigValue quotes s for a codex -c key=<value> TOML fragment. A URL
-// should never contain characters outside TOML's basic-string subset; if it
-// does, an empty value is safer than one that could break out of the string
-// and set a second key.
+// or effort level should never contain characters outside TOML's basic-string
+// subset; if it does, an empty value is safer than one that could break out of
+// the string and set a second key.
 func codexConfigValue(s string) string {
 	for _, r := range s {
 		if r < 0x20 || r == '"' || r == '\\' || r == 0x7f {

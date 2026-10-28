@@ -23,6 +23,9 @@ For Copilot BYOK runs, `Job.BaseURL` sets `COPILOT_PROVIDER_BASE_URL` and
 `COPILOT_PROVIDER_*` credentials and wire settings as bare keys, so container
 and remote runners can inject their values without placing secrets in argv.
 
+Codex runs with analytics, apps, and plugins turned off through `-c` overrides,
+which take precedence over the same keys in the caller's `config.toml`.
+
 The library owns the details that differ between CLIs: binary names, arguments,
 credential and state environment variables, project instruction files, skill
 directories, model API hosts, JSONL parsing, account-limit errors, default
@@ -71,9 +74,9 @@ uses `--system-prompt` with Claude and the backend's project instruction file
 for the other CLIs.
 
 `MaxTurns` uses the backend default when set to zero; Copilot maps it to maximum
-autopilot continuations. `Effort` applies to Claude and Copilot. `AllowedTools`
-applies only to Claude. `ResumeSessionID` and `ResumePrompt` continue an
-existing conversation.
+autopilot continuations. `Effort` applies to Claude, Codex, and Copilot.
+`AllowedTools` applies only to Claude. `ResumeSessionID` and `ResumePrompt`
+continue an existing conversation.
 
 The `Harness` interface exposes the parts needed by local, container, and remote
 runners:

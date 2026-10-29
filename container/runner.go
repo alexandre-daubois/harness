@@ -160,6 +160,11 @@ func (r Runner) argsAt(h harness.Harness, j harness.Job, absWork, workDir string
 		"--rm",
 		"--cap-drop", "ALL",
 	)
+	if r.Runtime.supportsInit() {
+		// The kernel drops signals that PID 1 has no handler for, so without an
+		// init a cancelled run keeps an agent such as codex running.
+		args = append(args, "--init")
+	}
 	args = appendHostUser(args)
 	args = append(args,
 		"-e", "HOME=/tmp",

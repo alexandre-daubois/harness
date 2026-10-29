@@ -154,6 +154,12 @@ func (rt Runtime) checkHostIsolation() error {
 	return nil
 }
 
+// supportsInit reports whether the runtime accepts `--init`. Apple's container
+// CLI 0.7.1 does not expose it.
+func (rt Runtime) supportsInit() bool {
+	return rt.Bin != runtimeApple
+}
+
 // supportsPIDsLimit reports whether the runtime accepts `--pids-limit`.
 // Apple's container CLI does not expose it.
 func (rt Runtime) supportsPIDsLimit() bool {

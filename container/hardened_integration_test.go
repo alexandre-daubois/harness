@@ -3,6 +3,7 @@
 package container
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alpha-omega-security/harness"
 )
@@ -64,6 +66,35 @@ func TestIntegrationHardenedRunner(t *testing.T) {
 	runner := integrationHardenedRunner(t, rt, image, "http://harness:token@host.docker.internal:3128")
 	if err := runner.Run(t.Context(), integrationHarness{}, harness.Job{Workspace: t.TempDir()}, func(harness.Event) {}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type sleepHarness struct{ integrationHarness }
+
+func (sleepHarness) Binary() string            { return "sleep" }
+func (sleepHarness) Args(harness.Job) []string { return []string{"60"} }
+
+// TestIntegrationCancelStopsTheContainer pins that cancelling a run stops a PID 1 with no SIGTERM handler.
+func TestIntegrationCancelStopsTheContainer(t *testing.T) {
+	image := os.Getenv("HARNESS_TEST_RUNNER_IMAGE")
+	if image == "" {
+		t.Skip("set HARNESS_TEST_RUNNER_IMAGE to a cached image containing sleep")
+	}
+	rt, ok := DetectRuntime("docker")
+	if !ok {
+		t.Skip("docker is unavailable")
+	}
+	if !imageExistsLocally(t.Context(), rt, image) {
+		t.Skipf("image %q is not cached", image)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := (Runner{Runtime: rt, Image: image}).Run(ctx, sleepHarness{}, harness.Job{Workspace: t.TempDir()}, nil); err == nil {
+		t.Fatal("cancelled run succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Fatalf("cancelled run returned after %s", elapsed)
 	}
 }
 

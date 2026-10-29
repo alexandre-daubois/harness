@@ -155,6 +155,15 @@ func TestRunnerArgs_ReadOnly(t *testing.T) {
 	}
 }
 
+func TestRunnerArgs_Init(t *testing.T) {
+	if got := (Runner{}).args(stubHarness{}, harness.Job{Workspace: WorkMount}, "/abs/work"); !slices.Contains(got, "--init") {
+		t.Errorf("expected --init in %v", got)
+	}
+	if got := (Runner{Runtime: Runtime{Bin: "apple"}}).args(stubHarness{}, harness.Job{Workspace: WorkMount}, "/abs/work"); slices.Contains(got, "--init") {
+		t.Errorf("apple: must not set --init: %v", got)
+	}
+}
+
 func TestRunnerArgs_Limits(t *testing.T) {
 	limited := Runner{Memory: "2g", CPUs: "2", PIDsLimit: 256, FileSizeLimit: 67108864}
 	got := limited.args(stubHarness{}, harness.Job{Workspace: WorkMount}, "/abs/work")

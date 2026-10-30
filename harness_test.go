@@ -204,3 +204,41 @@ func TestNameFallsBackToBinary(t *testing.T) {
 		t.Errorf("Name() = %q", got)
 	}
 }
+
+func TestValidateCredentialEnv(t *testing.T) {
+	tests := []struct {
+		name    string
+		h       Harness
+		baseURL string
+		key     string
+		value   string
+		wantErr bool
+	}{
+		{"claude oauth token", ClaudeHarness{}, "", "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-abc", false},
+		{"claude token with captured output", ClaudeHarness{}, "", "CLAUDE_CODE_OAUTH_TOKEN", "Opening browser...\nsk-ant-oat01-abc", true},
+		{"claude key with trailing newline", ClaudeHarness{}, "", "ANTHROPIC_API_KEY", "sk-ant-api03-abc\n", true},
+		{"codex key with leading space", CodexHarness{}, "", "CODEX_API_KEY", " sk-abc", true},
+		{"copilot token with tab", CopilotHarness{}, "", "GH_TOKEN", "gho_abc\tdef", true},
+		{"copilot byok key with newline", CopilotHarness{}, "https://llm.example", "COPILOT_PROVIDER_API_KEY", "abc\r\n", true},
+		{"opencode multi-line json config", OpencodeHarness{}, "", "OPENCODE_CONFIG_CONTENT", "{\n  \"model\": \"x\"\n}\n", false},
+		{"key unused by backend", ClaudeHarness{}, "", "CODEX_API_KEY", "bad\n", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, k := range []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY", "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_PROVIDER_API_KEY", "COPILOT_PROVIDER_BEARER_TOKEN", "OPENCODE_CONFIG_CONTENT", "OPENCODE_AUTH_CONTENT"} {
+				t.Setenv(k, "")
+			}
+			t.Setenv(tt.key, tt.value)
+			err := ValidateCredentialEnv(tt.h, tt.baseURL)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateCredentialEnv() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), tt.key) {
+				t.Errorf("error %q does not name %s", err, tt.key)
+			}
+			if err != nil && strings.Contains(err.Error(), tt.value) {
+				t.Errorf("error %q leaks the value", err)
+			}
+		})
+	}
+}

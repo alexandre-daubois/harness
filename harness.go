@@ -212,3 +212,23 @@ func passthroughEnv(keys ...string) []string {
 	}
 	return entries
 }
+
+// ValidateCredentialEnv checks the API key and token values h would pass
+// through from the environment. The backends send them as HTTP header values,
+// so a value with a line break (for example, captured command output) fails
+// every run with an auth error. JSON config entries are not checked.
+func ValidateCredentialEnv(h Harness, baseURL string) error {
+	for _, key := range h.Env(baseURL) {
+		if strings.Contains(key, "=") || (!strings.HasSuffix(key, "_API_KEY") && !strings.HasSuffix(key, "_TOKEN")) {
+			continue
+		}
+		value := os.Getenv(key)
+		if strings.TrimSpace(value) != value {
+			return fmt.Errorf("%s has leading or trailing whitespace", key)
+		}
+		if strings.ContainsFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+			return fmt.Errorf("%s contains a line break or control character", key)
+		}
+	}
+	return nil
+}
